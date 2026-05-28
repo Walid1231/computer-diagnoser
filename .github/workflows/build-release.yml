@@ -1,0 +1,91 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build Executable
+        run: |
+          pyinstaller --onefile --noconsole --name "ComputerDiagnoser" ^
+            --add-data "frontend;frontend" ^
+            --hidden-import uvicorn.logging ^
+            --hidden-import uvicorn.loops ^
+            --hidden-import uvicorn.loops.auto ^
+            --hidden-import uvicorn.protocols ^
+            --hidden-import uvicorn.protocols.http ^
+            --hidden-import uvicorn.protocols.http.auto ^
+            --hidden-import uvicorn.protocols.websockets ^
+            --hidden-import uvicorn.protocols.websockets.auto ^
+            --hidden-import uvicorn.lifespan ^
+            --hidden-import uvicorn.lifespan.on ^
+            --icon=NUL ^
+            backend/app.py
+
+      - name: Verify Build
+        shell: bash
+        run: |
+          if [ -f "dist/ComputerDiagnoser.exe" ]; then
+            echo "Build successful!"
+          else
+            echo "Build failed!"
+            exit 1
+          fi
+
+      - name: Get Version
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=$(python -c "import sys; sys.path.insert(0, './backend'); from diagnostics.version import __version__; print(__version__)")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if Release Exists
+        id: check_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ env.VERSION }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release $TAG already exists. Skipping release creation."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Release $TAG does not exist. Creating new release."
+          fi
+
+      - name: Create Release and Upload Asset
+        if: steps.check_release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Computer Diagnoser v${{ env.VERSION }}
+          draft: false
+          prerelease: false
+          files: dist/ComputerDiagnoser.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
