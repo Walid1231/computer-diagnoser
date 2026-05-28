@@ -26,7 +26,6 @@ pyinstaller --onefile --noconsole --name "ComputerDiagnoser" ^
     --hidden-import uvicorn.protocols.websockets.auto ^
     --hidden-import uvicorn.lifespan ^
     --hidden-import uvicorn.lifespan.on ^
-    --icon=NUL ^
     backend/app.py
 
 echo.
