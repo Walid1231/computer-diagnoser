@@ -7,6 +7,7 @@ A premium system diagnostic and storage analysis tool for Windows. It provides a
 - **System Intelligence Overview**: Real-time monitor for CPU, RAM, and Disk metrics.
 - **Interactive AI Chat Engine**: Diagnoses issues in natural language based on your actual computer status.
 - **Storage Intelligence**: Detailed breakdown of file types, folder sizes, large files, duplicates, and safe temp cleaner.
+- **Needed vs. Unneeded Explorer**: Click any file category (even "Other") or folder to see what is inside. Every folder and file is rated ✅ Safe to delete, ⚠️ Review first or 🔒 Keep (needed), with the reason. The server re-checks every delete/clean request, and system locations can never be deleted.
 - **System Health & Security**: Battery wear report, SMART disk diagnostics, CPU/GPU temperatures, and Windows Event Viewer crash log analysis.
 - **Optimization Tools**: System boost (RAM & Cache flush), startup program manager, process killer, and speed test.
 - **Auto-Updater**: One-click updates that download, install, and relaunch automatically from GitHub Releases.

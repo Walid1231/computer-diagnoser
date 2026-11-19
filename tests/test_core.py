@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 
-from diagnostics import ai_chat, chat_engine, health, network, security, startup, storage, system, tools, updater
+from diagnostics import ai_chat, chat_engine, classifier, health, network, security, startup, storage, system, tools, updater
 from diagnostics.utils import format_bytes, ttl_cache
 
 
@@ -538,3 +538,194 @@ def test_gemini_key_goes_in_header_not_url(monkeypatch):
     assert "SECRET" not in seen["url"] and "?" not in seen["url"] and "gemini-2.0-flash" in seen["url"]
     assert seen["headers"]["x-goog-api-key"] == "SECRET"
     assert [c["role"] for c in seen["payload"]["contents"]] == ["user", "model", "user"]
+
+
+# ─── classifier: needed vs unneeded ──────────────────────────
+
+@pytest.mark.parametrize("path,is_dir,verdict,cleanable", [
+    (r"C:\Windows\WinSxS\amd64_foo", True, "keep", False),
+    (r"C:\Windows\System32\drivers", True, "keep", False),
+    (r"C:\Windows\Temp", True, "safe", True),
+    (r"C:\Windows\SoftwareDistribution\Download", True, "safe", True),
+    (r"C:\Windows\Installer", True, "keep", False),
+    (r"C:\Windows.old", True, "review", False),                    # not mistaken for C:\Windows
+    (r"C:\Program Files\Adobe", True, "keep", False),
+    (r"C:\Program Files (x86)\Steam", True, "keep", False),
+    (r"C:\ProgramData\Package Cache", True, "review", False),
+    (r"C:\ProgramData\Foo", True, "keep", False),
+    (r"C:\Users\Walid\AppData\Local\Temp", True, "safe", True),
+    (r"C:\Users\Walid\AppData\Local\Temp\sub", True, "safe", True),
+    (r"C:\Users\Walid\AppData\Local\Google\Chrome\User Data\Default\Cache", True, "safe", True),
+    (r"C:\Users\Walid\AppData\Local\Google\Chrome\User Data\Default\Code Cache", True, "safe", True),
+    (r"C:\Users\Walid\AppData\Local\Google\Chrome\User Data\Default", True, "keep", False),   # bookmarks, passwords
+    (r"C:\Users\Walid\AppData\Local\Programs\Python", True, "keep", False),
+    (r"C:\Users\Walid\AppData\Roaming\Code", True, "review", False),
+    (r"C:\Users\Walid\Documents\thesis", True, "keep", False),
+    (r"C:\Users\Walid\Documents\proj\__pycache__", True, "safe", True),
+    (r"C:\Users\Walid\Downloads", True, "review", False),
+    (r"C:\Users\Walid\.cache\huggingface\hub", True, "review", False),    # large but re-downloadable: user decides
+    (r"C:\Users\Walid\proj\.git\objects", True, "keep", False),
+    (r"C:\Users\Walid\proj\node_modules", True, "review", False),
+    (r"C:\Users\Walid\anaconda3\envs\torch", True, "keep", False),
+    (r"C:\Users\Walid\anaconda3\pkgs", True, "review", False),
+    (r"C:\Users\Walid\Temp", True, "review", False),                # a user folder merely *named* Temp is not junk
+    (r"C:\Temp", True, "review", False),
+    (r"D:\games\stuff", True, "review", False),
+])
+def test_folder_verdicts(path, is_dir, verdict, cleanable):
+    info = classifier.classify(path, is_dir)
+    assert (info["verdict"], info["cleanable"]) == (verdict, cleanable), info
+
+
+@pytest.mark.parametrize("path,verdict", [
+    (r"C:\pagefile.sys", "keep"),
+    (r"C:\hiberfil.sys", "keep"),
+    (r"C:\Windows\System32\kernel32.dll", "keep"),
+    (r"C:\Program Files\App\x.tmp", "keep"),                        # a .tmp in a protected place stays protected
+    (r"C:\Users\Walid\AppData\Local\Temp\a.tmp", "safe"),
+    (r"C:\Users\Walid\Desktop\notes.tmp", "keep"),                  # personal folders are never junk
+    (r"C:\Users\Walid\Projects\x.dmp", "safe"),
+    (r"C:\Users\Walid\Projects\~$report.docx", "safe"),             # Office lock file
+    (r"C:\Users\Walid\Downloads\setup.exe", "review"),
+    (r"C:\Users\Walid\Downloads\ubuntu.iso", "review"),
+    (r"C:\Users\Walid\Projects\model.bin", "review"),
+    (r"D:\backup\db.bak", "review"),
+])
+def test_file_verdicts(path, verdict):
+    assert classifier.classify(path, False)["verdict"] == verdict
+
+
+def test_every_verdict_has_an_explanation():
+    for path, is_dir in [(r"C:\Windows\WinSxS", True), (r"C:\x\y", True), (r"C:\x\a.tmp", False), (r"C:\x\y.bak", False)]:
+        info = classifier.classify(path, is_dir)
+        assert info["label"] and len(info["reason"]) > 10
+
+
+def test_hibernation_hint_never_suggests_deleting():
+    assert "powercfg" in classifier.classify(r"C:\hiberfil.sys", False)["reason"]
+
+
+# ─── explorer: category / browse / smart clean ───────────────
+
+def test_explore_category_splits_other_by_verdict(tmp_path):
+    root = str(tmp_path)
+    write(f"{root}/proj/data.xyz", 1_000_000)                      # unknown type -> "Other", review
+    write(f"{root}/proj/__pycache__/m.pyc", 400_000)               # regenerable -> safe
+    write(f"{root}/proj/.git/objects/pack.idx", 300_000)           # repository history -> keep
+    write(f"{root}/proj/notes.txt", 10_000)                        # Document, not Other
+
+    result = storage.explore_category(root, "Other", top_n=10, time_limit=20)
+    assert result["files"] == 3
+    assert result["summary"]["safe"]["size_bytes"] == 400_000
+    assert result["summary"]["review"]["size_bytes"] == 1_000_000
+    assert result["summary"]["keep"]["size_bytes"] == 300_000
+    assert result["total_bytes"] == 1_700_000
+
+    # agrees with the main scan's "Other" figure
+    scan_other = next(t for t in storage.scan_path(root, 5, 1, 20)["file_types"] if t["category"] == "Other")
+    assert scan_other["size_bytes"] == result["total_bytes"] and scan_other["count"] == result["files"]
+
+    names = [f["name"] for f in result["largest_files"]]
+    assert names == ["data.xyz", "m.pyc", "pack.idx"]
+    by_name = {f["name"]: f for f in result["largest_files"]}
+    assert by_name["m.pyc"]["verdict"] == "safe" and by_name["m.pyc"]["can_delete"]
+    assert by_name["pack.idx"]["verdict"] == "keep" and not by_name["pack.idx"]["can_delete"]
+    exts = {e["extension"]: e for e in result["extensions"]}
+    assert exts[".pyc"]["verdict"] == "safe" and exts[".xyz"]["verdict"] == "review"
+    assert sum(l["size_bytes"] for l in result["locations"]) == 1_700_000   # locations add up to the total
+    assert result["locations"][0]["size_bytes"] == 1_000_000
+
+
+def test_explore_category_temp_files_are_safe(tmp_path):
+    write(f"{tmp_path}/a/x.tmp", 5000)
+    result = storage.explore_category(str(tmp_path), "Temporary", top_n=5, time_limit=20)
+    assert result["summary"]["safe"]["size_bytes"] == 5000
+
+
+def test_explore_category_validates_input(tmp_path):
+    with pytest.raises(ValueError):
+        storage.explore_category(str(tmp_path), "Nonsense")
+    with pytest.raises(ValueError):
+        storage.explore_category(str(tmp_path / "missing"), "Other")
+
+
+def test_browse_folder(tmp_path):
+    root = str(tmp_path)
+    write(f"{root}/big/a.bin", 2_000_000)
+    write(f"{root}/big/deep/b.bin", 1_000_000)
+    write(f"{root}/small/c.bin", 10)
+    write(f"{root}/top.tmp", 500)
+    result = storage.browse_folder(root)
+    assert [i["name"] for i in result["items"]] == ["big", "top.tmp", "small"]
+    big = result["items"][0]
+    assert big["is_dir"] and big["size_bytes"] == 3_000_000
+    assert result["items"][1]["verdict"] == "safe" and result["items"][1]["can_delete"]
+    assert result["total_bytes"] == 3_000_510 and result["parent"] == os.path.dirname(root)
+    inner = storage.browse_folder(f"{root}/big")
+    assert [i["name"] for i in inner["items"]] == ["a.bin", "deep"] or [i["name"] for i in inner["items"]] == ["deep", "a.bin"]
+    with pytest.raises(ValueError):
+        storage.browse_folder(f"{root}/nope")
+
+
+def test_browse_skips_links(tmp_path):
+    write(f"{tmp_path}/real/f.bin", 1000)
+    try:
+        os.symlink(f"{tmp_path}/real", f"{tmp_path}/link", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available")
+    assert [i["name"] for i in storage.browse_folder(str(tmp_path))["items"]] == ["real"]
+
+
+def test_clean_target_accepts_only_safe_cleanable_folders(tmp_path):
+    cache = tmp_path / "proj" / "__pycache__"
+    write(str(cache / "a.pyc"), 700)
+    write(str(cache / "sub" / "b.pyc"), 300)
+    write(str(tmp_path / "proj" / "main.py"), 50)
+    git = tmp_path / "proj" / ".git"
+    write(str(git / "HEAD"), 20)
+    node = tmp_path / "proj" / "node_modules"
+    write(str(node / "x" / "index.js"), 99)
+
+    ok = storage.clean_target(str(cache))
+    assert ok["success"] and ok["freed_bytes"] == 1000 and cache.exists() and not list(cache.iterdir())
+    assert (tmp_path / "proj" / "main.py").exists()                 # neighbours untouched
+
+    for refused in (git, node, tmp_path / "proj", tmp_path):         # keep / review / unknown folders
+        out = storage.clean_target(str(refused))
+        assert not out["success"], refused
+    assert (git / "HEAD").exists() and (node / "x" / "index.js").exists()
+
+
+def test_clean_target_cannot_be_tricked_with_path_tricks(tmp_path):
+    cache = tmp_path / "proj" / "__pycache__"
+    write(str(cache / "a.pyc"), 10)
+    write(str(tmp_path / "proj" / "main.py"), 50)
+    # "..\" segments resolve to the project folder, which is not safe-to-clean
+    out = storage.clean_target(str(cache) + os.sep + "..")
+    assert not out["success"] and (tmp_path / "proj" / "main.py").exists()
+    # a link that points at a cache folder is refused outright
+    try:
+        os.symlink(str(cache), str(tmp_path / "link"), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return
+    assert not storage.clean_target(str(tmp_path / "link"))["success"]
+    assert (cache / "a.pyc").exists()
+
+
+def test_clean_target_never_cleans_protected_locations(tmp_path, monkeypatch):
+    win = tmp_path / "Windows"
+    write(str(win / "Prefetch" / "x.pf"), 10)
+    monkeypatch.setenv("WINDIR", str(win))
+    monkeypatch.setenv("SystemRoot", str(win))
+    assert not storage.clean_target(str(win / "Prefetch"))["success"]
+    assert (win / "Prefetch" / "x.pf").exists()
+
+
+def test_location_grouping_goes_deeper_inside_users():
+    j = lambda *p: os.sep.join(p)
+    root = j("", "data") if os.sep == "/" else "C:\\"
+    base = root.rstrip(os.sep)
+    assert storage._group_key(root, j(base, "Windows", "System32", "drivers", "etc")) == j(base, "Windows", "System32", "drivers")
+    assert storage._group_key(root, j(base, "Users", "Walid", "AppData", "Local", "Google", "Chrome", "Cache")) == \
+        j(base, "Users", "Walid", "AppData", "Local", "Google")
+    assert storage._group_key(root, root) == root.rstrip("\\/") + os.sep

@@ -211,6 +211,20 @@
                 </div>
             </div>
 
+            <!-- Explorer: what is inside a category / folder, and is it needed? -->
+            <div class="card" id="storage-explorer-card" style="display:none">
+                <div class="card-header">
+                    <h3 id="explorer-title">Explorer</h3>
+                    <div class="card-header-actions">
+                        <span class="badge" id="explorer-badge"></span>
+                        <button class="btn-action-delete" onclick="closeExplorer()">✕ Close</button>
+                    </div>
+                </div>
+                <div id="explorer-summary"></div>
+                <div class="explorer-tabs" id="explorer-tabs"></div>
+                <div id="explorer-body"></div>
+            </div>
+
             <!-- Folder Sizes -->
             <div class="card" id="storage-folders-card">
                 <div class="card-header">

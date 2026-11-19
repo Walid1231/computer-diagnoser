@@ -240,8 +240,8 @@ function renderFileTypes(types) {
     const maxSize = types[0].size_bytes || 1;
     badge.textContent = `${types.length} categories`;
 
-    container.innerHTML = types.map((t, i) => `
-        <div class="type-bar-container">
+    container.innerHTML = '<div class="explore-hint">👆 Click any category (especially <b>Other</b>) to see what is inside and which parts are needed.</div>' + types.map((t, i) => `
+        <div class="type-bar-container clickable" data-category="${esc(t.category)}" title="Click to see what is inside ${esc(t.category)}">
             <div class="type-bar-label">
                 <span class="type-bar-name">
                     <span class="dot" style="background:${CHART_COLORS[i % CHART_COLORS.length]}"></span>
@@ -266,9 +266,9 @@ function renderFolderSizes(folders) {
     const maxSize = folders[0].size_bytes || 1;
 
     container.innerHTML = folders.map(f => `
-        <div class="folder-item">
+        <div class="folder-item clickable" data-browse="${esc(f.path)}" title="Click to look inside">
             <span class="folder-icon">📁</span>
-            <span class="folder-name" title="${esc(f.path)}">${esc(f.name)}</span>
+            <span class="folder-name clickable" title="${esc(f.path)}">${esc(f.name)}</span>
             <span class="folder-size">${esc(f.size_display)}</span>
             <div class="folder-bar-wrap">
                 <div class="type-bar">
@@ -732,6 +732,15 @@ async function runChatAction(action, button) {
 
 // One delegated handler for every dynamically created button.
 document.addEventListener('click', async (e) => {
+    const exEl = e.target.closest('[data-ex]');
+    if (exEl) { handleExplorerAction(exEl); return; }
+    const tabEl = e.target.closest('[data-xtab]');
+    if (tabEl) { setExplorerTab(tabEl.dataset.xtab); return; }
+    const catEl = e.target.closest('[data-category]');
+    if (catEl) { exploreCategory(catEl.dataset.category); return; }
+    const browseEl = e.target.closest('[data-browse]');
+    if (browseEl) { browseFolder(browseEl.dataset.browse, true); return; }
+
     const target = e.target.closest('button');
     if (!target) return;
 
@@ -766,6 +775,256 @@ document.addEventListener('click', async (e) => {
         if (action) runChatAction(action, target);
     }
 });
+
+// ─── STORAGE EXPLORER (what is inside Other / a folder, and is it needed?) ──────
+// The server classifies every folder and file as safe / review / keep (diagnostics/classifier.py).
+// The UI only displays that and sends the user's explicit choices back; the server re-checks
+// every delete/clean request, so nothing here can bypass the safety rules.
+
+const VERDICT_LABEL = { safe: '✅ Safe to delete', review: '⚠️ Review first', keep: '🔒 Keep (needed)' };
+let explorer = { category: null, root: null, data: null, tab: 'locations', browse: null };
+let explorerItems = [];
+
+function verdictBadge(v) {
+    return `<span class="verdict v-${esc(v)}">${esc(VERDICT_LABEL[v] || v)}</span>`;
+}
+
+function stackedBar(safe, review, keep, cls) {
+    const total = (safe + review + keep) || 1;
+    const w = n => (n / total * 100).toFixed(1);
+    return `<div class="${cls}">
+        <div class="v-safe" style="width:${w(safe)}%"></div>
+        <div class="v-review" style="width:${w(review)}%"></div>
+        <div class="v-keep" style="width:${w(keep)}%"></div>
+    </div>`;
+}
+
+function showExplorerCard(title, badge) {
+    const card = document.getElementById('storage-explorer-card');
+    card.style.display = '';
+    document.getElementById('explorer-title').textContent = title;
+    document.getElementById('explorer-badge').textContent = badge || '';
+    return card;
+}
+
+function closeExplorer() {
+    document.getElementById('storage-explorer-card').style.display = 'none';
+    explorer = { category: null, root: null, data: null, tab: 'locations', browse: null };
+}
+
+async function exploreCategory(category) {
+    const root = document.getElementById('drive-selector').value || 'C:\\';
+    explorer = { category, root, data: null, tab: 'locations', browse: null };
+    const card = showExplorerCard(`What is inside "${category}"?`, 'Analyzing…');
+    document.getElementById('explorer-summary').innerHTML = '';
+    document.getElementById('explorer-tabs').innerHTML = '';
+    document.getElementById('explorer-body').innerHTML =
+        '<div class="loading-placeholder">Analyzing every file in this category… this can take up to a minute on a big drive.</div>';
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+    const { ok, data, status } = await api(
+        `/api/storage/category?path=${encodeURIComponent(root)}&category=${encodeURIComponent(category)}`);
+    if (!ok || !data) {
+        document.getElementById('explorer-body').innerHTML =
+            `<div class="loading-placeholder">Could not analyze this category${status === 400 ? ' (folder not found).' : '.'} Please try again.</div>`;
+        return;
+    }
+    explorer.data = data;
+    renderCategoryExplorer();
+}
+
+function renderCategoryExplorer() {
+    const d = explorer.data;
+    if (!d) return;
+    showExplorerCard(`What is inside "${d.category}"? — ${d.total_display}`, `${d.files.toLocaleString()} files`);
+
+    const s = d.summary;
+    document.getElementById('explorer-summary').innerHTML = `
+        ${stackedBar(s.safe.size_bytes, s.review.size_bytes, s.keep.size_bytes, 'verdict-bar')}
+        <div class="verdict-legend">
+            <span>${verdictBadge('safe')} <b>${esc(s.safe.size_display)}</b> regenerable junk</span>
+            <span>${verdictBadge('review')} <b>${esc(s.review.size_display)}</b> your call</span>
+            <span>${verdictBadge('keep')} <b>${esc(s.keep.size_display)}</b> needed by Windows / your programs</span>
+        </div>
+        <div class="explorer-note">
+            Sorted by what the app recognises. Nothing is deleted without your confirmation, and system locations can never be deleted.
+            Windows sizes can overlap (hard links), so real usage may be lower.
+            ${d.partial ? '<br>⚠️ Time limit reached — numbers are partial.' : ''}
+        </div>`;
+
+    const tabs = [['locations', '📍 Where it lives'], ['extensions', '🧩 File types'],
+                  ['files', '📄 Biggest files'], ['browse', '📂 Browse folders']];
+    document.getElementById('explorer-tabs').innerHTML = tabs.map(([key, label]) =>
+        `<button class="explorer-tab ${explorer.tab === key ? 'active' : ''}" data-xtab="${key}">${label}</button>`).join('');
+
+    renderExplorerTab();
+}
+
+function setExplorerTab(tab) {
+    explorer.tab = tab;
+    document.querySelectorAll('#explorer-tabs .explorer-tab').forEach(b =>
+        b.classList.toggle('active', b.dataset.xtab === tab));
+    renderExplorerTab();
+}
+
+function renderExplorerTab() {
+    const body = document.getElementById('explorer-body');
+    const d = explorer.data;
+    if (explorer.tab === 'browse') {
+        browseFolder(explorer.browse || explorer.root, false);
+        return;
+    }
+    if (!d) return;
+
+    if (explorer.tab === 'locations') {
+        explorerItems = d.locations.map(l => ({ ...l, is_dir: true }));
+        body.innerHTML = explorerItems.length
+            ? explorerItems.map((item, i) => explorerRow(item, i, { fullPath: true, mini: true })).join('')
+            : '<div class="loading-placeholder">Nothing found.</div>';
+    } else if (explorer.tab === 'extensions') {
+        explorerItems = d.extensions;
+        body.innerHTML = explorerItems.map(x => `
+            <div class="ex-row">
+                <div class="ex-main">
+                    ${verdictBadge(x.verdict)}
+                    <span class="ex-name">${esc(x.extension)}</span>
+                    <span class="ex-size">${esc(x.size_display)}</span>
+                </div>
+                ${stackedBar(x.safe_bytes, x.review_bytes, x.keep_bytes, 'ex-mini')}
+                <div class="ex-sub">${x.count.toLocaleString()} files</div>
+            </div>`).join('') || '<div class="loading-placeholder">Nothing found.</div>';
+    } else {
+        explorerItems = d.largest_files;
+        body.innerHTML = explorerItems.length
+            ? explorerItems.map((item, i) => explorerRow(item, i, { fullPath: true })).join('')
+            : '<div class="loading-placeholder">Nothing found.</div>';
+    }
+}
+
+function explorerRow(item, index, opts = {}) {
+    const isDir = item.is_dir === true;
+    const name = opts.fullPath ? item.path : item.name;
+    const actions = [];
+    if (isDir) actions.push(`<button class="btn-ghost" data-ex="open" data-index="${index}">📂 Open</button>`);
+    if (item.can_clean) actions.push(`<button class="btn-action-delete" data-ex="clean" data-index="${index}">🧹 Clean</button>`);
+    if (item.can_delete) actions.push(`<button class="btn-action-delete" data-ex="delete" data-index="${index}">🗑️ Delete</button>`);
+    actions.push(`<button class="btn-ghost" data-ex="reveal" data-index="${index}">Show in Explorer</button>`);
+
+    const mini = opts.mini ? stackedBar(item.safe_bytes || 0, item.review_bytes || 0, item.keep_bytes || 0, 'ex-mini') : '';
+    const count = item.count ? ` • ${item.count.toLocaleString()} files here` : '';
+    return `
+        <div class="ex-row">
+            <div class="ex-main">
+                ${verdictBadge(item.verdict)}
+                <span class="ex-name ${isDir ? 'folder' : ''}" ${isDir ? `data-ex="open" data-index="${index}"` : ''} title="${esc(item.path)}">${isDir ? '📁 ' : ''}${esc(name)}</span>
+                <span class="ex-size">${esc(item.size_display)}</span>
+            </div>
+            ${mini}
+            <div class="ex-sub"><b>${esc(item.label)}</b> — ${esc(item.reason)}${count}</div>
+            <div class="ex-actions">${actions.join('')}</div>
+        </div>`;
+}
+
+function crumbsHtml(path) {
+    const sep = path.includes('\\') ? '\\' : '/';
+    const parts = path.split(/[\\/]+/).filter(Boolean);
+    let acc = '';
+    return parts.map((part, i) => {
+        if (i === 0) acc = part.endsWith(':') ? part + sep : part;
+        else acc = acc.endsWith(sep) ? acc + part : acc + sep + part;
+        return `<button data-browse="${esc(acc)}">${esc(part)}</button>`;
+    }).join(' › ');
+}
+
+async function browseFolder(path, fromList = false) {
+    // Opened from the folder list (no category analysis): show a plain browser card.
+    if (fromList && !explorer.data) {
+        showExplorerCard('Folder contents', 'Loading…');
+        document.getElementById('explorer-summary').innerHTML = '';
+        document.getElementById('explorer-tabs').innerHTML = '';
+        document.getElementById('storage-explorer-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else if (fromList && explorer.data) {
+        explorer.tab = 'browse';
+        document.querySelectorAll('#explorer-tabs .explorer-tab').forEach(b =>
+            b.classList.toggle('active', b.dataset.xtab === 'browse'));
+    }
+    explorer.browse = path;
+    const body = document.getElementById('explorer-body');
+    body.innerHTML = '<div class="loading-placeholder">Reading folder sizes…</div>';
+
+    const { ok, data, status } = await api(`/api/storage/browse?path=${encodeURIComponent(path)}`);
+    if (explorer.browse !== path) return;   // the user already moved on
+    if (!ok || !data) {
+        body.innerHTML = `<div class="crumbs">${crumbsHtml(path)}</div>
+            <div class="loading-placeholder">${status === 400 && data && data.detail ? esc(data.detail) : 'Could not open this folder.'}</div>`;
+        return;
+    }
+
+    explorerItems = data.items;
+    const up = data.parent ? `<button class="btn-ghost" style="font-size:0.75rem;padding:4px 10px" data-browse="${esc(data.parent)}">⬆ Up</button>` : '';
+    if (!explorer.data) document.getElementById('explorer-badge').textContent = data.total_display;
+    body.innerHTML = `
+        <div class="crumbs">${up} ${crumbsHtml(data.path)}</div>
+        <div class="ex-sub" style="margin-bottom:8px">${verdictBadge(data.verdict)} <b>${esc(data.label)}</b> — ${esc(data.reason)}
+            • Total here: <b>${esc(data.total_display)}</b>${data.partial ? ' (partial — time limit reached)' : ''}</div>
+        ${data.items.length ? data.items.map((item, i) => explorerRow(item, i)).join('')
+                            : '<div class="loading-placeholder">This folder is empty.</div>'}
+        ${data.hidden_items ? `<div class="ex-sub">…and ${data.hidden_items} smaller items not shown.</div>` : ''}`;
+}
+
+async function handleExplorerAction(el) {
+    const action = el.dataset.ex;
+    const item = explorerItems[Number(el.dataset.index)];
+    if (!item) return;
+
+    if (action === 'open') { browseFolder(item.path, true); return; }
+
+    if (action === 'reveal') {
+        const result = await postJSON('/api/action/reveal', { path: item.path });
+        if (!result || !result.success) showToast('error', (result && result.error) || 'Could not open Explorer.');
+        return;
+    }
+
+    const isClean = action === 'clean';
+    const warn = item.verdict === 'review'
+        ? '\n\n⚠️ The app could not tell for sure that this is junk. Make sure you do not need it.'
+        : '';
+    const ok = await showConfirm({
+        title: isClean ? 'Clean Folder?' : 'Delete File?',
+        message: isClean
+            ? `Delete the contents of "${item.path}" (${item.size_display})?\n\n${item.label}: ${item.reason}\n\nFiles in use are skipped. The folder itself is kept.${warn}`
+            : `Permanently delete "${item.name}" (${item.size_display})?\n\nPath: ${item.path}\n\n${item.label}: ${item.reason}\n\nThis cannot be undone.${warn}`,
+        confirmText: isClean ? 'Clean Folder' : 'Delete File',
+    });
+    if (!ok) return;
+
+    el.disabled = true;
+    const result = await postJSON(isClean ? '/api/action/clean-folder' : '/api/action/delete-file', { path: item.path });
+    if (result && result.success) {
+        showToast('success', `${result.message} — freed ${result.freed}`);
+        if (explorer.tab === 'browse' || !explorer.data) {
+            browseFolder(explorer.browse || item.path, false);       // quick: re-read the folder
+        } else {
+            // Category views need a full re-scan; just drop the row and let the user refresh.
+            const list = explorer.tab === 'locations' ? explorer.data.locations
+                       : explorer.tab === 'files' ? explorer.data.largest_files : null;
+            if (list) {
+                explorer.data[explorer.tab === 'files' ? 'largest_files' : 'locations'] = list.filter(i => i.path !== item.path);
+            }
+            renderExplorerTab();
+            document.getElementById('explorer-badge').textContent = 'Freed space — re-open the category to refresh totals';
+        }
+        loadDrivesQuietly();
+    } else {
+        el.disabled = false;
+        showToast('error', (result && result.error) || 'Could not complete the action (the item may be in use).');
+    }
+}
+
+async function loadDrivesQuietly() {
+    const drives = await fetchJSON('/api/storage/drives');
+    if (drives && drives.length) renderDrivesGrid('#storage-drives-grid', drives, true);
+}
 
 // ─── CHAT / DIAGNOSE ─────────────────────────────────────────
 
@@ -1337,6 +1596,7 @@ async function initVersionAndUpdates() {
         });
     }
     checkForUpdates(false);  // background check (silent)
+    setInterval(() => checkForUpdates(false), 6 * 60 * 60 * 1000);  // and every 6 hours while the app stays open
 }
 
 async function checkForUpdates(manual = false) {
@@ -1374,6 +1634,12 @@ async function checkForUpdates(manual = false) {
             if (banner && bannerText) {
                 bannerText.textContent = `🚀 A new version (v${data.latest_version}) is available!`;
                 banner.style.display = 'flex';
+            }
+            if (resultDiv && data.release_notes) {
+                resultDiv.style.display = 'block';
+                resultDiv.className = 'test-result success';
+                resultDiv.textContent = `What's new in v${data.latest_version}:\n${data.release_notes}`;
+                resultDiv.style.whiteSpace = 'pre-line';
             }
             if (manual) showToast('success', `Version v${data.latest_version} is available!`);
         } else if (!data || data.error) {

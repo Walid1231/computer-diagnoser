@@ -134,6 +134,25 @@ def api_scan(path: str = "C:\\", top_n: int = 30, min_size_mb: float = 50):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.get("/api/storage/category")
+def api_explore_category(path: str = "C:\\", category: str = "Other", top_n: int = 40):
+    """What is inside a file category (e.g. "Other"): locations, extensions, biggest files,
+    each marked safe / review / keep."""
+    try:
+        return storage.explore_category(_checked_dir(path), category, max(5, min(top_n, 100)))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/storage/browse")
+def api_browse_folder(path: str = "C:\\"):
+    """List one folder's contents with sizes and a safe / review / keep verdict per item."""
+    try:
+        return storage.browse_folder(_checked_dir(path))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.get("/api/storage/large-files")
 def api_large_files(path: str = "C:\\", top_n: int = 30, min_size_mb: float = 50):
     return storage.get_large_files(_checked_dir(path), max(1, min(top_n, 200)), max(1.0, min_size_mb))
@@ -364,8 +383,9 @@ def api_test_config():
 # ─── DELETE / CLEAN ENDPOINTS ─────────────────────────────────
 # The safety rules live in diagnostics.storage so they are unit-testable:
 #  * delete-file refuses system locations (Windows, Program Files, drive roots...).
-#  * clean-folder only accepts folders from storage.cleanup_targets(). Before, it accepted
-#    almost any path, so one bad request could empty Documents or a whole drive.
+#  * clean-folder only accepts folders from storage.cleanup_targets() or folders the classifier
+#    rates "safe" and "cleanable" (re-checked here on the server). Before, it accepted almost
+#    any path, so one bad request could empty Documents or a whole drive.
 
 class DeleteFileRequest(BaseModel):
     path: str
@@ -383,8 +403,14 @@ def api_delete_file(req: DeleteFileRequest):
 
 @app.post("/api/action/clean-folder")
 def api_clean_folder(req: DeleteFolderContentsRequest):
-    """Empty a temp/cache folder from the approved list. The folder itself is kept."""
+    """Empty a temp/cache folder that is safe to clean. The folder itself is kept."""
     return storage.clean_target(req.path)
+
+
+@app.post("/api/action/reveal")
+def api_reveal(req: DeleteFolderContentsRequest):
+    """Show a file or folder in Windows Explorer."""
+    return storage.reveal_in_explorer(req.path)
 
 
 # ─── UPDATE ENDPOINTS ─────────────────────────────────────────
