@@ -1264,6 +1264,8 @@ body {
     font-size: 0.85rem;
     line-height: 1.6;
     margin-bottom: 20px;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
 }
 
 .modal-actions {
@@ -1469,4 +1471,69 @@ body {
     font-weight: 700;
     font-size: 0.85rem;
     flex-shrink: 0;
+}
+
+
+/* ─── ADDITIONS (scan status, temp actions, startup state) ── */
+
+.scan-status {
+    margin-top: 12px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.scan-status.partial {
+    color: var(--accent-amber);
+}
+
+.card-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.temp-item .btn-action-delete {
+    margin-left: 12px;
+    white-space: nowrap;
+}
+
+.temp-admin-note {
+    color: var(--accent-amber);
+    font-size: 0.7rem;
+    margin-left: 6px;
+}
+
+.row-disabled td:first-child {
+    opacity: 0.55;
+    text-decoration: line-through;
+}
+
+.btn-action-enable {
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.25);
+    color: var(--accent-green);
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    font-size: 0.7rem;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.btn-action-enable:hover {
+    background: rgba(16, 185, 129, 0.2);
+    border-color: var(--accent-green);
+}
+
+.chat-content .chat-line.spacer {
+    height: 6px;
+}
+
+.chat-content pre.chat-code {
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.78rem;
+    background: rgba(255,255,255,0.04);
+    padding: 8px 10px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 6px 0;
 }

@@ -3,10 +3,18 @@ Network Diagnostics Module
 Checks connectivity, active connections, and network interfaces.
 """
 
-import psutil
+import re
 import socket
-import subprocess
-import platform
+
+import psutil
+
+from diagnostics.utils import format_bytes
+from diagnostics.winutil import IS_WINDOWS, run_hidden
+
+_format_bytes = format_bytes
+
+# A hostname or IP only: blocks option injection ("-f"), spaces, shell metacharacters.
+_HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9.:\-]{1,253}$")
 
 
 def get_network_info():
@@ -42,65 +50,73 @@ def get_network_info():
         if iface in io_counters:
             iface_info["bytes_sent"] = io_counters[iface].bytes_sent
             iface_info["bytes_recv"] = io_counters[iface].bytes_recv
-            iface_info["bytes_sent_display"] = _format_bytes(io_counters[iface].bytes_sent)
-            iface_info["bytes_recv_display"] = _format_bytes(io_counters[iface].bytes_recv)
+            iface_info["bytes_sent_display"] = format_bytes(io_counters[iface].bytes_sent)
+            iface_info["bytes_recv_display"] = format_bytes(io_counters[iface].bytes_recv)
 
         interfaces.append(iface_info)
 
+    # Connected adapters first.
+    interfaces.sort(key=lambda i: (not i["is_up"], i["name"].lower()))
     return interfaces
 
 
-def get_active_connections(top_n: int = 20):
-    """Get active network connections."""
-    connections = []
-    for conn in psutil.net_connections(kind='inet'):
-        try:
-            c = {
-                "family": "IPv4" if conn.family == socket.AF_INET else "IPv6",
-                "type": "TCP" if conn.type == socket.SOCK_STREAM else "UDP",
-                "local_addr": f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else "",
-                "remote_addr": f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "",
-                "status": conn.status,
-                "pid": conn.pid,
-            }
-            # Try to get process name
-            if conn.pid:
-                try:
-                    c["process"] = psutil.Process(conn.pid).name()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    c["process"] = "Unknown"
-            connections.append(c)
-        except (psutil.AccessDenied, OSError):
-            continue
+def get_active_connections(top_n: int = 50):
+    """Active network connections, established ones first.
 
+    The old version returned the first 20 connections in arbitrary order (mostly idle
+    listeners) and looked each process name up one by one; this builds one pid->name
+    map and sorts by usefulness.
+    """
+    try:
+        raw = psutil.net_connections(kind='inet')
+    except (psutil.AccessDenied, OSError):
+        return []
+
+    names = {}
+    for proc in psutil.process_iter(['pid', 'name']):
+        names[proc.info['pid']] = proc.info['name']
+
+    connections = []
+    for conn in raw:
+        connections.append({
+            "family": "IPv4" if conn.family == socket.AF_INET else "IPv6",
+            "type": "TCP" if conn.type == socket.SOCK_STREAM else "UDP",
+            "local_addr": f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else "",
+            "remote_addr": f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "",
+            "status": conn.status,
+            "pid": conn.pid,
+            "process": names.get(conn.pid, "Unknown") if conn.pid else "System",
+        })
+
+    def rank(c):
+        if c["status"] == "ESTABLISHED":
+            return 0
+        return 1 if c["remote_addr"] else 2
+
+    connections.sort(key=lambda c: (rank(c), c["process"].lower()))
     return connections[:top_n]
 
 
 def ping_test(host: str = "8.8.8.8", count: int = 4):
     """Run a ping test to check connectivity."""
-    try:
-        param = "-n" if platform.system().lower() == "windows" else "-c"
-        result = subprocess.run(
-            ["ping", param, str(count), host],
-            capture_output=True, text=True, timeout=15
-        )
-        return {
-            "host": host,
-            "success": result.returncode == 0,
-            "output": result.stdout,
-        }
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        return {
-            "host": host,
-            "success": False,
-            "output": str(e),
-        }
+    host = (host or "").strip()
+    if not _HOST_RE.match(host):
+        return {"host": host, "success": False, "output": "Invalid host name or IP address."}
 
+    count = max(1, min(int(count), 10))
+    if IS_WINDOWS:
+        command = ["ping", "-n", str(count), "-w", "2000", host]
+    else:
+        command = ["ping", "-c", str(count), "-W", "2", host]
 
-def _format_bytes(size: int) -> str:
-    """Convert bytes to a human-readable format."""
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} PB"
+    proc = run_hidden(command, timeout=count * 3 + 5)
+    if proc is None:
+        return {"host": host, "success": False, "output": "Ping timed out or is not available."}
+    output = proc.stdout or proc.stderr or ""
+    # Windows ping exits 0 even for "Destination host unreachable" replies from the
+    # local gateway, so a real reply (it contains "TTL=") is required for success.
+    return {
+        "host": host,
+        "success": proc.returncode == 0 and "ttl=" in output.lower(),
+        "output": output,
+    }

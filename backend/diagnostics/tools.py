@@ -4,126 +4,208 @@ Kill processes, system boost, speed test, duplicate finder,
 and startup item toggle.
 """
 
-import os
-import subprocess
 import hashlib
-import time
-import psutil
+import os
 import socket
+import statistics
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+import psutil
+
+from diagnostics import startup, storage, system
+from diagnostics.utils import format_bytes
+from diagnostics.winutil import IS_WINDOWS, run_hidden
+
+_format_bytes = format_bytes
 
 
 # ─── KILL PROCESS ────────────────────────────────────────────
 
+_PROTECTED_PROCESSES = {
+    "system", "system idle process", "registry", "memcompression", "smss.exe", "csrss.exe",
+    "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "lsm.exe", "svchost.exe",
+    "dwm.exe", "explorer.exe", "fontdrvhost.exe", "securityhealthservice.exe", "msmpeng.exe",
+    "sihost.exe", "ctfmon.exe", "taskhostw.exe", "runtimebroker.exe",
+}
+
+
+def _own_process_tree():
+    """PIDs of this app, its parents (PyInstaller launcher) and children (WebView2)."""
+    pids = {os.getpid()}
+    try:
+        me = psutil.Process()
+        pids.update(p.pid for p in me.parents())
+        pids.update(p.pid for p in me.children(recursive=True))
+    except psutil.Error:
+        pass
+    return pids
+
+
 def kill_process(pid: int):
     """Kill a process by PID."""
-    PROTECTED = ["System", "csrss.exe", "wininit.exe", "smss.exe",
-                 "services.exe", "lsass.exe", "winlogon.exe", "svchost.exe",
-                 "explorer.exe", "dwm.exe"]
+    if pid <= 4:
+        return {"success": False, "error": "Cannot kill core system processes."}
+    if pid in _own_process_tree():
+        return {"success": False, "error": "Cannot kill Computer Diagnoser itself."}
+
     try:
         proc = psutil.Process(pid)
-        if proc.name() in PROTECTED:
-            return {"success": False, "error": f"Cannot kill protected system process: {proc.name()}"}
         name = proc.name()
+        if name.lower() in _PROTECTED_PROCESSES:
+            return {"success": False, "error": f"Cannot kill protected system process: {name}"}
+
         proc.terminate()
-        proc.wait(timeout=5)
-        return {"success": True, "message": f"Terminated {name} (PID: {pid})"}
+        try:
+            proc.wait(timeout=5)
+            message = f"Terminated {name} (PID: {pid})"
+        except psutil.TimeoutExpired:
+            proc.kill()
+            message = f"Force-killed {name} (PID: {pid})"
+        system.invalidate_process_cache()
+        return {"success": True, "message": message}
     except psutil.NoSuchProcess:
         return {"success": False, "error": f"Process {pid} not found."}
     except psutil.AccessDenied:
-        return {"success": False, "error": f"Access denied. Try running as Administrator."}
-    except psutil.TimeoutExpired:
-        try:
-            psutil.Process(pid).kill()
-            return {"success": True, "message": f"Force-killed process (PID: {pid})"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": "Access denied. Try running as Administrator."}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 
 # ─── SYSTEM BOOST ────────────────────────────────────────────
 
+def _trim_working_sets() -> int:
+    """Ask Windows to page out idle memory of processes we are allowed to touch.
+
+    Returns how many processes were trimmed. Windows pages the data back in on
+    demand, so this only helps while memory is actually scarce.
+    """
+    if not IS_WINDOWS:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+        psapi.EmptyWorkingSet.restype = wintypes.BOOL
+
+        access = 0x0100 | 0x1000  # PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION
+        skip = _own_process_tree() | {0, 4}
+        trimmed = 0
+        for pid in psutil.pids():
+            if pid in skip:
+                continue
+            handle = kernel32.OpenProcess(access, False, pid)
+            if not handle:
+                continue
+            try:
+                if psapi.EmptyWorkingSet(handle):
+                    trimmed += 1
+            finally:
+                kernel32.CloseHandle(handle)
+        return trimmed
+    except Exception:
+        return 0
+
+
 def system_boost():
     """
-    1-Click System Boost: Cleans temp files, flushes DNS, clears
-    standby memory list, and closes non-essential background apps.
+    1-Click System Boost: clears user temp/cache folders, flushes the DNS cache and
+    thumbnail cache, and (only when memory is actually tight) trims idle memory.
+    Only things that really happened are reported.
     """
-    results = []
+    actions = []
+    skipped = []
     freed_bytes = 0
 
-    # 1. Clean user TEMP folder
-    temp_dir = os.environ.get("TEMP", "")
-    if temp_dir and os.path.isdir(temp_dir):
+    # 1. Temp / cache folders that are always safe to empty.
+    for target in storage.cleanup_targets():
+        if not target["boost"]:
+            continue
+        result = storage.clean_directory_contents(target["path"])
+        freed_bytes += result["freed_bytes"]
+        if result["deleted"]:
+            note = f" ({result['errors']} in use, skipped)" if result["errors"] else ""
+            actions.append(f"Cleaned {target['name']}: {result['freed']}{note}")
+        elif result["errors"]:
+            skipped.append(f"{target['name']}: all files are in use")
+
+    # 2. Flush DNS cache.
+    if IS_WINDOWS:
+        proc = run_hidden(["ipconfig", "/flushdns"], timeout=10)
+        if proc is not None and proc.returncode == 0:
+            actions.append("Flushed DNS cache")
+        else:
+            skipped.append("DNS flush failed")
+
+    # 3. Thumbnail cache (Explorer keeps some of these files locked; those are skipped).
+    thumb_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Explorer")
+    if os.environ.get("LOCALAPPDATA") and os.path.isdir(thumb_dir):
         count = 0
-        for item in os.listdir(temp_dir):
-            try:
-                fp = os.path.join(temp_dir, item)
-                if os.path.isfile(fp):
-                    size = os.path.getsize(fp)
-                    os.remove(fp)
+        for name in os.listdir(thumb_dir):
+            if name.lower().startswith("thumbcache"):
+                path = os.path.join(thumb_dir, name)
+                try:
+                    size = os.path.getsize(path)
+                    os.remove(path)
                     freed_bytes += size
                     count += 1
-            except (PermissionError, OSError):
-                continue
-        results.append(f"Cleaned {count} temp files ({_format_bytes(freed_bytes)})")
-
-    # 2. Flush DNS cache
-    try:
-        subprocess.run(["ipconfig", "/flushdns"],
-                       capture_output=True, timeout=10)
-        results.append("Flushed DNS cache")
-    except Exception:
-        results.append("DNS flush skipped")
-
-    # 3. Clear Windows thumbnail cache
-    thumb_path = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                              "Microsoft", "Windows", "Explorer")
-    if os.path.isdir(thumb_path):
-        t_count = 0
-        for f in os.listdir(thumb_path):
-            if f.startswith("thumbcache"):
-                try:
-                    fp = os.path.join(thumb_path, f)
-                    size = os.path.getsize(fp)
-                    os.remove(fp)
-                    freed_bytes += size
-                    t_count += 1
-                except (PermissionError, OSError):
+                except OSError:
                     continue
-        if t_count:
-            results.append(f"Cleared {t_count} thumbnail cache files")
+        if count:
+            actions.append(f"Cleared {count} thumbnail cache files")
 
-    # 4. Clear font cache
-    try:
-        subprocess.run(["powershell", "-NoProfile", "-Command",
-                        "Remove-Item $env:LOCALAPPDATA\\*.log -ErrorAction SilentlyContinue"],
-                       capture_output=True, timeout=5)
-    except Exception:
-        pass
+    # 4. Memory: only worthwhile when RAM is under pressure.
+    before = psutil.virtual_memory()
+    if before.percent >= 75:
+        trimmed = _trim_working_sets()
+        if trimmed:
+            time.sleep(0.8)
+            gained = max(0, psutil.virtual_memory().available - before.available)
+            actions.append(f"Trimmed idle memory of {trimmed} processes (+{format_bytes(gained)} available RAM)")
+    else:
+        skipped.append(f"Memory trim skipped: RAM is healthy ({before.percent:.0f}% used)")
 
+    storage.invalidate_caches()
     return {
         "success": True,
-        "actions": results,
+        "actions": actions,
+        "skipped": skipped,
         "freed_bytes": freed_bytes,
-        "freed_display": _format_bytes(freed_bytes),
-        "message": f"System boost complete! Freed {_format_bytes(freed_bytes)}. "
-                   f"Performed {len(results)} optimizations.",
+        "freed_display": format_bytes(freed_bytes),
+        "message": f"System boost complete! Freed {format_bytes(freed_bytes)}. "
+                   f"Performed {len(actions)} optimizations.",
     }
 
 
 # ─── INTERNET SPEED TEST ────────────────────────────────────
 
-def speed_test():
-    """
-    Simple download speed test using a known test file.
-    Measures download speed without any external dependencies.
-    """
-    import urllib.request
+def _tcp_latency_ms(host: str, port: int, tries: int = 3):
+    samples = []
+    for _ in range(tries):
+        started = time.perf_counter()
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                pass
+            samples.append((time.perf_counter() - started) * 1000)
+        except OSError:
+            continue
+    return round(statistics.median(samples), 1) if samples else None
 
+
+def speed_test():
+    """Download speed + latency test using public speed-test endpoints (no extra libraries)."""
     TEST_URLS = [
-        ("http://speedtest.tele2.net/1MB.zip", 1_000_000),
-        ("http://proof.ovh.net/files/1Mb.dat", 1_000_000),
+        "https://speed.cloudflare.com/__down?bytes=10000000",
+        "http://speedtest.tele2.net/10MB.zip",
     ]
+    MAX_SECONDS = 8
 
     result = {
         "download_mbps": None,
@@ -132,31 +214,31 @@ def speed_test():
         "message": "Speed test failed. Check your internet connection.",
     }
 
-    # Latency test
-    try:
-        start = time.time()
-        socket.create_connection(("8.8.8.8", 53), timeout=5)
-        result["latency_ms"] = round((time.time() - start) * 1000, 1)
-    except Exception:
-        result["latency_ms"] = None
+    result["latency_ms"] = _tcp_latency_ms("1.1.1.1", 443) or _tcp_latency_ms("8.8.8.8", 53)
 
-    # Download speed test
-    for url, expected_size in TEST_URLS:
+    for url in TEST_URLS:
         try:
-            start = time.time()
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            response = urllib.request.urlopen(req, timeout=15)
-            data = response.read()
-            elapsed = time.time() - start
-
-            if elapsed > 0 and len(data) > 0:
-                bits = len(data) * 8
-                mbps = round((bits / elapsed) / 1_000_000, 2)
-                result["download_mbps"] = mbps
-                result["download_size"] = _format_bytes(len(data))
-                result["download_time"] = round(elapsed, 2)
-                result["success"] = True
-                result["message"] = f"Download: {mbps} Mbps | Latency: {result['latency_ms']}ms"
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                first = response.read(1024)           # exclude connection setup from the timing
+                started = time.perf_counter()
+                received = 0
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk or time.perf_counter() - started > MAX_SECONDS:
+                        break
+                    received += len(chunk)
+            elapsed = time.perf_counter() - started
+            received += len(first)
+            if elapsed > 0.05 and received > 100_000:
+                mbps = round((received * 8 / elapsed) / 1_000_000, 2)
+                result.update({
+                    "download_mbps": mbps,
+                    "download_size": format_bytes(received),
+                    "download_time": round(elapsed, 2),
+                    "success": True,
+                    "message": f"Download: {mbps} Mbps | Latency: {result['latency_ms']}ms",
+                })
                 break
         except Exception:
             continue
@@ -166,167 +248,176 @@ def speed_test():
 
 # ─── DUPLICATE FILE FINDER ───────────────────────────────────
 
-def find_duplicates(path: str, min_size_mb: float = 10):
-    """
-    Find duplicate files by comparing file sizes first, then
-    partial MD5 hashes. Returns groups of duplicate files.
-    """
-    min_size = int(min_size_mb * 1024 * 1024)
-    start_time = time.time()
-    TIME_LIMIT = 30
-    SKIP_DIRS = {'$Recycle.Bin', 'System Volume Information',
-                 'Windows', '.git', 'node_modules', '__pycache__'}
+_QUICK_BYTES = 64 * 1024
 
-    # Phase 1: Group files by size
-    size_groups = {}
-    file_count = 0
 
-    try:
-        for root, dirs, files in os.walk(path):
-            if time.time() - start_time > TIME_LIMIT:
+def _quick_hash(path: str, size: int) -> str:
+    """Hash of the first and last 64 KB (+ size): cheap filter before a full hash."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(size).encode())
+    with open(path, "rb") as handle:
+        digest.update(handle.read(_QUICK_BYTES))
+        if size > _QUICK_BYTES * 2:
+            handle.seek(-_QUICK_BYTES, os.SEEK_END)
+            digest.update(handle.read(_QUICK_BYTES))
+    return digest.hexdigest()
+
+
+def _full_hash(path: str) -> str:
+    digest = hashlib.blake2b(digest_size=20)
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _collect_candidates(path: str, min_bytes: int, deadline: float):
+    """Parallel scan: {size: [(path, mtime), ...]} for files >= min_bytes (system folders skipped)."""
+    top_entries, tasks = storage._plan_tasks(path)
+    groups = {}
+    count = 0
+    partial = False
+
+    def run(task):
+        _, directory, large_ok, recurse = task
+        found = []
+        if not large_ok:
+            return found, False
+        stack = [(directory, True)]
+        was_partial = False
+        while stack:
+            if time.monotonic() > deadline:
+                was_partial = True
                 break
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-            for f in files:
-                try:
-                    fp = os.path.join(root, f)
-                    size = os.path.getsize(fp)
-                    if size >= min_size:
-                        if size not in size_groups:
-                            size_groups[size] = []
-                        size_groups[size].append(fp)
-                        file_count += 1
-                except (PermissionError, OSError):
-                    continue
-    except (PermissionError, OSError):
-        pass
-
-    # Phase 2: Hash files with matching sizes
-    duplicates = []
-    for size, files in size_groups.items():
-        if len(files) < 2:
-            continue
-        if time.time() - start_time > TIME_LIMIT:
-            break
-
-        hash_groups = {}
-        for fp in files:
+            current, _ = stack.pop()
             try:
-                h = _partial_hash(fp)
-                if h not in hash_groups:
-                    hash_groups[h] = []
-                hash_groups[h].append(fp)
-            except (PermissionError, OSError):
+                iterator = os.scandir(current)
+            except OSError:
+                continue
+            with iterator:
+                for entry in iterator:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            lowered = entry.name.lower()
+                            if (recurse and lowered not in storage.SKIP_ALWAYS
+                                    and lowered not in storage.LARGE_SKIP_DIRS
+                                    and not storage._is_dir_link(entry)):
+                                stack.append((entry.path, True))
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if st.st_size >= min_bytes and not storage._is_cloud_only(st):
+                        found.append((st.st_size, entry.path, st.st_mtime))
+        return found, was_partial
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for found, was_partial in pool.map(run, tasks):
+            partial = partial or was_partial
+            for size, file_path, mtime in found:
+                groups.setdefault(size, []).append((file_path, mtime))
+                count += 1
+    return groups, count, partial
+
+
+def find_duplicates(path: str, min_size_mb: float = 10, time_limit: float = 45):
+    """
+    Find truly identical files: same size -> same first/last 64 KB -> same full-file hash.
+    Only fully verified groups are reported, because the UI offers to delete them.
+    """
+    started = time.monotonic()
+    deadline = started + time_limit
+    min_bytes = max(1, int(min_size_mb * 1024 * 1024))
+
+    groups, file_count, partial = _collect_candidates(path, min_bytes, started + time_limit * 0.45)
+
+    # Biggest candidates first, so the most valuable groups get verified within the time limit.
+    candidates = sorted(((size, files) for size, files in groups.items() if len(files) >= 2),
+                        key=lambda item: item[0] * len(item[1]), reverse=True)
+
+    def verify(item):
+        size, files = item
+        if time.monotonic() > deadline:
+            return size, None
+        # Hard links share the same data: deleting one frees nothing, so count them once.
+        unique = {}
+        for file_path, mtime in files:
+            try:
+                st = os.stat(file_path)
+                identity = (st.st_dev, st.st_ino) if st.st_ino else file_path
+            except OSError:
+                continue
+            unique.setdefault(identity, (file_path, mtime))
+        files = list(unique.values())
+        if len(files) < 2:
+            return size, []
+
+        quick = {}
+        for file_path, mtime in files:
+            try:
+                quick.setdefault(_quick_hash(file_path, size), []).append((file_path, mtime))
+            except OSError:
                 continue
 
-        for h, matched_files in hash_groups.items():
-            if len(matched_files) >= 2:
+        verified = []
+        for same in quick.values():
+            if len(same) < 2:
+                continue
+            full = {}
+            for file_path, mtime in same:
+                if time.monotonic() > deadline:
+                    return size, None
+                try:
+                    full.setdefault(_full_hash(file_path), []).append((file_path, mtime))
+                except OSError:
+                    continue
+            verified.extend(g for g in full.values() if len(g) >= 2)
+        return size, verified
+
+    duplicates = []
+    unverified = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for size, verified in pool.map(verify, candidates):
+            if verified is None:
+                unverified += 1
+                continue
+            for same in verified:
+                same.sort(key=lambda f: f[1])  # oldest first: that one is the one to keep
+                wasted = size * (len(same) - 1)
                 duplicates.append({
                     "size_bytes": size,
-                    "size_display": _format_bytes(size),
-                    "count": len(matched_files),
-                    "wasted_bytes": size * (len(matched_files) - 1),
-                    "wasted_display": _format_bytes(size * (len(matched_files) - 1)),
-                    "files": [{"path": f, "name": os.path.basename(f)} for f in matched_files],
+                    "size_display": format_bytes(size),
+                    "count": len(same),
+                    "wasted_bytes": wasted,
+                    "wasted_display": format_bytes(wasted),
+                    "files": [{"path": p, "name": os.path.basename(p), "keep": i == 0}
+                              for i, (p, _) in enumerate(same)],
                 })
 
-    duplicates.sort(key=lambda x: x["wasted_bytes"], reverse=True)
+    duplicates.sort(key=lambda d: d["wasted_bytes"], reverse=True)
     total_wasted = sum(d["wasted_bytes"] for d in duplicates)
+
+    message = (f"Found {len(duplicates)} duplicate groups wasting {format_bytes(total_wasted)}."
+               if duplicates else "No significant duplicates found.")
+    if partial or unverified:
+        message += " (Time limit reached - results may be incomplete.)"
 
     return {
         "scanned_files": file_count,
         "duplicate_groups": len(duplicates),
         "duplicates": duplicates[:20],
         "total_wasted_bytes": total_wasted,
-        "total_wasted_display": _format_bytes(total_wasted),
-        "message": f"Found {len(duplicates)} duplicate groups wasting {_format_bytes(total_wasted)}."
-                   if duplicates else "No significant duplicates found.",
+        "total_wasted_display": format_bytes(total_wasted),
+        "partial": bool(partial or unverified),
+        "message": message,
     }
-
-
-def _partial_hash(filepath, chunk_size=8192):
-    """Generate a partial hash using first and last chunks of a file."""
-    h = hashlib.md5()
-    with open(filepath, 'rb') as f:
-        h.update(f.read(chunk_size))
-        f.seek(0, 2)
-        size = f.tell()
-        if size > chunk_size * 2:
-            f.seek(-chunk_size, 2)
-            h.update(f.read(chunk_size))
-    return h.hexdigest()
 
 
 # ─── STARTUP TOGGLE ──────────────────────────────────────────
 
-def toggle_startup_item(name: str, action: str, scope: str, location: str):
-    """
-    Enable or disable a startup item.
-    action: 'disable' or 'enable'
-    For registry items, moves them to a disabled subkey.
-    """
-    import winreg
-
-    PROTECTED = ["SecurityHealth", "WindowsDefender", "RtkAudUService"]
-    if name in PROTECTED:
-        return {"success": False, "error": f"Cannot modify protected startup item: {name}"}
-
-    if scope in ("Current User", "All Users"):
-        try:
-            # Determine hive
-            hive = winreg.HKEY_CURRENT_USER if "Current" in scope else winreg.HKEY_LOCAL_MACHINE
-
-            if action == "disable":
-                # Read current value
-                key = winreg.OpenKey(hive, location, 0, winreg.KEY_READ)
-                value, regtype = winreg.QueryValueEx(key, name)
-                winreg.CloseKey(key)
-
-                # Write to disabled subkey
-                disabled_path = location + "\\AutorunsDisabled"
-                try:
-                    dkey = winreg.OpenKey(hive, disabled_path, 0, winreg.KEY_WRITE)
-                except OSError:
-                    dkey = winreg.CreateKey(hive, disabled_path)
-                winreg.SetValueEx(dkey, name, 0, regtype, value)
-                winreg.CloseKey(dkey)
-
-                # Delete from original
-                key = winreg.OpenKey(hive, location, 0, winreg.KEY_WRITE)
-                winreg.DeleteValue(key, name)
-                winreg.CloseKey(key)
-
-                return {"success": True, "message": f"Disabled startup item: {name}"}
-
-            elif action == "enable":
-                disabled_path = location + "\\AutorunsDisabled"
-                dkey = winreg.OpenKey(hive, disabled_path, 0, winreg.KEY_READ)
-                value, regtype = winreg.QueryValueEx(dkey, name)
-                winreg.CloseKey(dkey)
-
-                # Restore to original
-                key = winreg.OpenKey(hive, location, 0, winreg.KEY_WRITE)
-                winreg.SetValueEx(key, name, 0, regtype, value)
-                winreg.CloseKey(key)
-
-                # Remove from disabled
-                dkey = winreg.OpenKey(hive, disabled_path, 0, winreg.KEY_WRITE)
-                winreg.DeleteValue(dkey, name)
-                winreg.CloseKey(dkey)
-
-                return {"success": True, "message": f"Enabled startup item: {name}"}
-
-        except OSError as e:
-            return {"success": False, "error": f"Registry error: {e}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    return {"success": False, "error": "Can only toggle registry-based startup items."}
-
-
-def _format_bytes(size: int) -> str:
-    """Convert bytes to a human-readable format."""
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} PB"
+def toggle_startup_item(name: str, action: str, scope: str, location: str,
+                        source: str = "Registry", key: str = ""):
+    """Enable or disable a startup item (see diagnostics.startup)."""
+    if action not in ("enable", "disable"):
+        return {"success": False, "error": "Action must be 'enable' or 'disable'."}
+    return startup.set_startup_enabled(name, action == "enable", scope, location, source, key)

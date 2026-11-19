@@ -5,10 +5,15 @@ Feeds live system diagnostic data as context for intelligent PC analysis.
 """
 
 import json
-import urllib.request
 import urllib.error
-from diagnostics import storage, system, network, startup
+import urllib.request
+
+from diagnostics import startup, storage, system
 from diagnostics.config import load_config
+from diagnostics.utils import format_bytes
+
+MAX_HISTORY_MESSAGES = 8
+MAX_MESSAGE_CHARS = 4000
 
 
 # ─── SYSTEM CONTEXT BUILDER ──────────────────────────────────
@@ -46,7 +51,7 @@ DRIVES:
 
     total_temp = sum(t["size_bytes"] for t in temp)
     if total_temp > 0:
-        context += f"\nTEMP/CACHE FILES: {storage._format_bytes(total_temp)} total cleanable\n"
+        context += f"\nTEMP/CACHE FILES: {format_bytes(total_temp)} total cleanable\n"
         for t in temp:
             context += f"  {t['name']} — {t['size_display']} at {t['path']}\n"
 
@@ -58,14 +63,15 @@ DRIVES:
         status = "Charging" if battery.get("power_plugged") else f"{battery.get('time_left', '?')} remaining"
         context += f"\nBATTERY: {battery.get('percent', '?')}% | {status}\n"
 
-    context += f"\nSTARTUP PROGRAMS: {len(startup_items)} items\n"
-    for s in startup_items[:10]:
+    enabled_items = [s for s in startup_items if s.get("enabled", True)]
+    context += f"\nSTARTUP PROGRAMS: {len(enabled_items)} enabled ({len(startup_items) - len(enabled_items)} disabled)\n"
+    for s in enabled_items[:10]:
         context += f"  {s['name']} — {s['scope']} ({s['source']})\n"
 
     return context
 
 
-SYSTEM_PROMPT = """You are an expert Windows PC diagnostic assistant embedded in a desktop application called "Computer Diagnoser". 
+SYSTEM_PROMPT = """You are an expert Windows PC diagnostic assistant embedded in a desktop application called "Computer Diagnoser".
 
 Your role:
 - Analyze the user's LIVE system data (provided below) and answer their questions accurately
@@ -79,91 +85,93 @@ You have access to REAL-TIME data from their PC. The data is refreshed each time
 Keep explanations simple and practical — the user is not a developer."""
 
 
+# ─── CONVERSATION HISTORY ────────────────────────────────────
+
+def clean_history(history) -> list:
+    """Keep the last few well-formed {role, content} turns (so follow-up questions work)."""
+    cleaned = []
+    for item in history or []:
+        if isinstance(item, dict):
+            role, content = item.get("role"), item.get("content")
+        else:
+            role, content = getattr(item, "role", None), getattr(item, "content", None)
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            cleaned.append({"role": role, "content": content[:MAX_MESSAGE_CHARS]})
+    cleaned = cleaned[-MAX_HISTORY_MESSAGES:]
+    # Claude and Gemini require the conversation to start with the user.
+    while cleaned and cleaned[0]["role"] != "user":
+        cleaned.pop(0)
+    return cleaned
+
+
+def _post_json(url: str, payload: dict, headers: dict) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **headers})
+    with urllib.request.urlopen(request, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 # ─── UNIVERSAL API CALLERS ────────────────────────────────────
 
-def call_openai_compatible(endpoint_url: str, api_key: str, model: str, question: str, context: str) -> str:
+def call_openai_compatible(endpoint_url, api_key, model, question, context, history=()) -> str:
     """
     Call any OpenAI-compatible API.
     Works with: OpenAI, Groq, Together, Mistral, DeepSeek, Fireworks,
     Perplexity, Ollama, LM Studio, vLLM, and hundreds more.
     """
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{context}"},
-            {"role": "user", "content": question},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 1500,
-    }
-    data = json.dumps(payload).encode("utf-8")
-    
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    
-    req = urllib.request.Request(endpoint_url, data=data, headers=headers)
-    
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    
+    messages = [{"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{context}"}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": question})
+    payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 1500}
+
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    result = _post_json(endpoint_url, payload, headers)
+
     try:
         return result["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, TypeError):
         return f"Unexpected response format: {json.dumps(result)[:300]}"
 
 
-def call_gemini(endpoint_url: str, api_key: str, model: str, question: str, context: str) -> str:
-    """Call Google Gemini API (different format from OpenAI)."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def call_gemini(endpoint_url, api_key, model, question, context, history=()) -> str:
+    """Call Google Gemini API. The key goes in a header, never in the URL (URLs end up in logs)."""
+    url = endpoint_url if endpoint_url and "{model}" not in endpoint_url and "googleapis.com" in endpoint_url \
+        else _GEMINI_URL.format(model=model)
+    url = url.split("?")[0].replace("{model}", model)
+
+    contents = [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+                for m in history]
+    contents.append({"role": "user", "parts": [{"text": question}]})
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": f"{SYSTEM_PROMPT}\n\n{context}\n\n---\nUser question: {question}"}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 1500,
-        }
+        "systemInstruction": {"parts": [{"text": f"{SYSTEM_PROMPT}\n\n{context}"}]},
+        "contents": contents,
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1500},
     }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    
+    result = _post_json(url, payload, {"x-goog-api-key": api_key})
+
     try:
         return result["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, TypeError):
         return f"Unexpected Gemini response: {json.dumps(result)[:300]}"
 
 
-def call_claude(endpoint_url: str, api_key: str, model: str, question: str, context: str) -> str:
+def call_claude(endpoint_url, api_key, model, question, context, history=()) -> str:
     """Call Anthropic Claude API (different format from OpenAI)."""
+    messages = list(history) + [{"role": "user", "content": question}]
     payload = {
         "model": model,
         "max_tokens": 1500,
         "system": f"{SYSTEM_PROMPT}\n\n{context}",
-        "messages": [
-            {"role": "user", "content": question}
-        ]
+        "messages": messages,
     }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(endpoint_url, data=data, headers={
-        "Content-Type": "application/json",
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-    })
-    
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    
+    result = _post_json(endpoint_url, payload, {"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+
     try:
         return result["content"][0]["text"]
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, TypeError):
         return f"Unexpected Claude response: {json.dumps(result)[:300]}"
 
 
@@ -178,7 +186,12 @@ FORMAT_MAP = {
 
 # ─── MAIN AI CHAT FUNCTION ───────────────────────────────────
 
-def process_ai_question(question: str) -> dict:
+def _error(title: str, message: str, intent: str = "error", question: str = "") -> dict:
+    return {"intent": intent, "question": question, "title": title,
+            "messages": [message], "actions": [], "ai_mode": False}
+
+
+def process_ai_question(question: str, history=None) -> dict:
     """Process a question using the configured AI provider with live system data."""
     config = load_config()
     api_format = config.get("api_format", "openai")
@@ -202,17 +215,13 @@ def process_ai_question(question: str) -> dict:
     call_fn = FORMAT_MAP.get(api_format, call_openai_compatible)
 
     try:
-        # Build fresh system context
         context = build_system_context()
-        
-        # Call the AI
-        response_text = call_fn(endpoint_url, api_key, model, question, context)
+        response_text = call_fn(endpoint_url, api_key, model, question, context, clean_history(history))
 
-        provider_name = config.get("ai_provider", "AI")
         return {
             "intent": "ai_response",
             "question": question,
-            "title": f"AI Analysis ({provider_name})",
+            "title": f"AI Analysis ({config.get('ai_provider') or 'AI'})",
             "messages": [response_text],
             "actions": [],
             "ai_mode": True,
@@ -221,44 +230,24 @@ def process_ai_question(question: str) -> dict:
     except urllib.error.HTTPError as e:
         error_body = ""
         try:
-            error_body = e.read().decode("utf-8")[:300]
-        except:
+            error_body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
             pass
-        
-        if e.code == 401 or e.code == 403:
+
+        if e.code in (401, 403):
             error_msg = "🔴 **Invalid API key.** Please check your key in Settings."
         elif e.code == 429:
             error_msg = "🟡 **Rate limit exceeded.** Wait a moment and try again."
         elif e.code == 404:
-            error_msg = f"🔴 **Endpoint not found (404).** Check your API URL in Settings.\nURL: {endpoint_url}"
+            error_msg = f"🔴 **Endpoint not found (404).** Check your API URL and model name in Settings.\nURL: {endpoint_url}"
         else:
             error_msg = f"🔴 **API Error ({e.code}):** {error_body}"
-
-        return {
-            "intent": "error",
-            "question": question,
-            "title": "AI Error",
-            "messages": [error_msg],
-            "actions": [],
-            "ai_mode": False,
-        }
+        return _error("AI Error", error_msg, question=question)
 
     except urllib.error.URLError as e:
-        return {
-            "intent": "error",
-            "question": question,
-            "title": "Connection Error",
-            "messages": [f"🔴 **Cannot reach API endpoint.**\n\nURL: {endpoint_url}\nError: {str(e.reason)}\n\nCheck your internet connection or if the local server is running."],
-            "actions": [],
-            "ai_mode": False,
-        }
+        return _error("Connection Error",
+                      f"🔴 **Cannot reach API endpoint.**\n\nURL: {endpoint_url}\nError: {e.reason}\n\n"
+                      "Check your internet connection or if the local server is running.", question=question)
 
     except Exception as e:
-        return {
-            "intent": "error",
-            "question": question,
-            "title": "Error",
-            "messages": [f"🔴 **Unexpected error:** {str(e)}"],
-            "actions": [],
-            "ai_mode": False,
-        }
+        return _error("Error", f"🔴 **Unexpected error:** {e}", question=question)

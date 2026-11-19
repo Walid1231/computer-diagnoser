@@ -4,36 +4,63 @@ Launches the diagnostic dashboard as a standalone desktop window.
 No browser needed.
 
 DEV MODE: Edit any file and changes apply:
-  - Python files (.py): Server auto-restarts
+  - Python files (.py): Restart the app
   - Frontend files (HTML/CSS/JS): Just close & reopen the app
 """
 
+import socket
 import threading
 import time
-import sys
-import webview
+import urllib.request
+
 import uvicorn
+import webview
+
 from main import app as fastapi_app
 
 
-def start_server():
-    """Run the FastAPI server in a background thread with auto-reload disabled
-    (reload doesn't work in threads, but restarts are fast with the bat file)."""
-    uvicorn.run(fastapi_app, host="127.0.0.1", port=8888, log_level="warning")
+def _bind_free_port() -> socket.socket:
+    """Reserve a free local port and keep it bound until the server takes it over.
+
+    The old launcher hard-coded port 8888: if anything else used it (or a second copy of
+    the app was open), the new window silently showed the *other* server's pages.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    return sock
+
+
+def _wait_until_ready(port: int, timeout: float = 20.0) -> bool:
+    """Poll the health endpoint instead of sleeping a fixed 1.5 s and hoping."""
+    deadline = time.monotonic() + timeout
+    url = f"http://127.0.0.1:{port}/api/health"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as resp:
+                if resp.status == 200:
+                    return True
+        except OSError:
+            time.sleep(0.1)
+    return False
 
 
 if __name__ == "__main__":
-    # Start the API server in background
-    server_thread = threading.Thread(target=start_server, daemon=True)
+    sock = _bind_free_port()
+    port = sock.getsockname()[1]
+
+    # log_config=None: the packaged app is built with --noconsole, where sys.stdout is None
+    # and uvicorn's default colourised log formatter crashes on it at startup.
+    config = uvicorn.Config(fastapi_app, log_config=None, access_log=False)
+    server = uvicorn.Server(config)
+    server_thread = threading.Thread(target=lambda: server.run(sockets=[sock]), daemon=True)
     server_thread.start()
 
-    # Give the server a moment to boot
-    time.sleep(1.5)
+    if not _wait_until_ready(port):
+        raise SystemExit("Computer Diagnoser could not start its local server.")
 
-    # Create native desktop window
-    window = webview.create_window(
+    webview.create_window(
         title="Computer Diagnoser",
-        url="http://127.0.0.1:8888",
+        url=f"http://127.0.0.1:{port}",
         width=1280,
         height=800,
         min_size=(900, 600),
@@ -41,5 +68,6 @@ if __name__ == "__main__":
         text_select=True,
     )
 
-    # Start the native window (blocks until closed)
+    # Blocks until the window is closed.
     webview.start()
+    server.should_exit = True

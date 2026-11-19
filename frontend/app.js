@@ -4,20 +4,66 @@
 
 const API = '';  // Same origin
 
+// ─── SAFE HTML HELPERS ───────────────────────────────────────
+// Everything that comes from the PC (file names, process names, startup commands,
+// event-log text...) is attacker-controllable, so it must be escaped before going
+// into innerHTML. A file named <img src=x onerror=...> used to run script that could
+// call the delete/kill APIs. Row buttons now carry data-* attributes and are handled by
+// one delegated click handler, instead of inlining values into onclick="" strings
+// (which also mangled backslashes in registry paths and broke on apostrophes).
+
+function esc(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+const escapeHtml = esc;
+
+// ─── API HELPERS ─────────────────────────────────────────────
+
+async function api(url, options) {
+    try {
+        const res = await fetch(API + url, options);
+        let data = null;
+        try { data = await res.json(); } catch (_) { /* non-JSON body */ }
+        return { ok: res.ok, status: res.status, data };
+    } catch (err) {
+        console.error(`Request failed: ${url}`, err);
+        return { ok: false, status: 0, data: null };
+    }
+}
+
+async function fetchJSON(url) {
+    const { ok, data } = await api(url);
+    return ok ? data : null;
+}
+
+async function postJSON(url, body) {
+    const { ok, data } = await api(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return ok ? data : null;
+}
+
 // ─── NAVIGATION ──────────────────────────────────────────────
 
+let currentSection = 'overview';
+
 function navigateTo(sectionId) {
-    // Update nav items
+    currentSection = sectionId;
+
     document.querySelectorAll('.nav-item').forEach(item => {
         item.classList.toggle('active', item.dataset.section === sectionId);
     });
-
-    // Update sections
     document.querySelectorAll('.content-section').forEach(section => {
         section.classList.toggle('active', section.id === `section-${sectionId}`);
     });
 
-    // Load section data
     loadSectionData(sectionId);
 }
 
@@ -27,19 +73,6 @@ document.querySelectorAll('.nav-item').forEach(item => {
         navigateTo(item.dataset.section);
     });
 });
-
-// ─── DATA LOADING ────────────────────────────────────────────
-
-async function fetchJSON(url) {
-    try {
-        const res = await fetch(API + url);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return await res.json();
-    } catch (err) {
-        console.error(`Fetch error: ${url}`, err);
-        return null;
-    }
-}
 
 function loadSectionData(section) {
     switch (section) {
@@ -55,6 +88,25 @@ function loadSectionData(section) {
     }
 }
 
+// ─── LIVE REFRESH ────────────────────────────────────────────
+// The overview and performance pages are "live monitors": refresh them every few
+// seconds, but only while they are visible, and never let requests pile up.
+
+const LIVE_INTERVAL_MS = 3000;
+let liveBusy = false;
+
+setInterval(async () => {
+    if (document.hidden || liveBusy) return;
+    if (currentSection !== 'overview' && currentSection !== 'performance') return;
+    liveBusy = true;
+    try {
+        if (currentSection === 'overview') await loadOverview();
+        else await loadPerformance();
+    } finally {
+        liveBusy = false;
+    }
+}, LIVE_INTERVAL_MS);
+
 // ─── OVERVIEW ────────────────────────────────────────────────
 
 async function loadOverview() {
@@ -64,10 +116,9 @@ async function loadOverview() {
         fetchJSON('/api/system/memory'),
         fetchJSON('/api/storage/drives'),
         fetchJSON('/api/system/battery'),
-        fetchJSON('/api/system/processes'),
+        fetchJSON('/api/system/processes?top_n=8'),
     ]);
 
-    // System info chips
     if (sysInfo) {
         setText('#chip-hostname .chip-value', sysInfo.hostname);
         setText('#chip-os .chip-value', sysInfo.os);
@@ -75,7 +126,6 @@ async function loadOverview() {
         setText('#chip-cpu-name .chip-value', truncate(sysInfo.processor, 40));
     }
 
-    // CPU card
     if (cpuInfo) {
         const cpuPct = cpuInfo.overall_percent;
         setText('#overview-cpu-value', `${cpuPct}%`);
@@ -83,7 +133,6 @@ async function loadOverview() {
         setText('#overview-cpu-detail', `${cpuInfo.physical_cores} cores / ${cpuInfo.logical_cores} threads • ${cpuInfo.current_freq_mhz} MHz`);
     }
 
-    // RAM card
     if (memInfo) {
         const ramPct = memInfo.ram.percent_used;
         setText('#overview-ram-value', `${ramPct}%`);
@@ -91,7 +140,6 @@ async function loadOverview() {
         setText('#overview-ram-detail', `${memInfo.ram.used_display} / ${memInfo.ram.total_display}`);
     }
 
-    // Disk card (primary drive)
     if (drives && drives.length > 0) {
         const primary = drives[0];
         setText('#overview-disk-value', `${primary.percent_used}%`);
@@ -102,7 +150,6 @@ async function loadOverview() {
         populateDriveSelector(drives);
     }
 
-    // Battery card
     if (battery && battery.available) {
         setText('#overview-battery-value', `${battery.percent}%`);
         setBarWidth('#overview-battery-bar', battery.percent);
@@ -112,13 +159,15 @@ async function loadOverview() {
         setText('#overview-battery-detail', 'No battery detected');
     }
 
-    // Processes
     if (processes) {
-        renderProcessTable('#overview-processes-tbody', processes.slice(0, 8));
+        renderProcessTable('#overview-processes-tbody', processes.slice(0, 8), false);
     }
 }
 
 // ─── STORAGE ─────────────────────────────────────────────────
+
+let lastTempItems = [];
+let lastLargeFiles = [];
 
 async function loadStorage() {
     const [drives, tempFiles] = await Promise.all([
@@ -130,32 +179,55 @@ async function loadStorage() {
         renderDrivesGrid('#storage-drives-grid', drives, true);
         populateDriveSelector(drives);
     }
-
     if (tempFiles) {
         renderTempFiles(tempFiles);
     }
 }
 
+const SCAN_BUTTON_HTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Scan Now`;
+
 async function scanDrive() {
     const btn = document.getElementById('btn-scan-drive');
+    const status = document.getElementById('scan-status');
     const path = document.getElementById('drive-selector').value;
 
     btn.disabled = true;
     btn.innerHTML = '<span class="loading-placeholder" style="padding:0;animation:shimmer 0.8s ease-in-out infinite;">Scanning...</span>';
+    status.className = 'scan-status';
+    status.textContent = 'Scanning… large drives can take up to a minute.';
 
-    const [fileTypes, folders, largeFiles] = await Promise.all([
-        fetchJSON(`/api/storage/file-types?path=${encodeURIComponent(path)}`),
-        fetchJSON(`/api/storage/folder-sizes?path=${encodeURIComponent(path)}`),
-        fetchJSON(`/api/storage/large-files?path=${encodeURIComponent(path)}&top_n=30&min_size_mb=50`),
-    ]);
+    // One request, one pass over the disk (it used to be three separate full scans in parallel).
+    const { ok, data, status: httpStatus } = await api(
+        `/api/storage/scan?path=${encodeURIComponent(path)}&top_n=30&min_size_mb=50`);
 
-    if (fileTypes) renderFileTypes(fileTypes);
-    if (folders) renderFolderSizes(folders);
-    if (largeFiles) renderLargeFiles(largeFiles);
+    if (ok && data) {
+        renderFileTypes(data.file_types);
+        renderFolderSizes(data.folders);
+        renderLargeFiles(data.large_files);
+
+        const summary = `Scanned ${data.files_scanned.toLocaleString()} files (${data.total_display}) in ${data.elapsed_seconds}s.`;
+        if (data.partial) {
+            status.className = 'scan-status partial';
+            status.textContent = `${summary} ⚠️ Time limit reached — results are partial (the biggest folders may be under-counted).`;
+        } else {
+            status.textContent = summary;
+        }
+    } else {
+        status.className = 'scan-status partial';
+        status.textContent = httpStatus === 400
+            ? `Scan failed: ${(data && data.detail) || 'folder not found.'}`
+            : 'Scan failed. Please try again.';
+    }
 
     btn.disabled = false;
-    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Scan Now`;
+    btn.innerHTML = SCAN_BUTTON_HTML;
 }
+
+const CHART_COLORS = [
+    'var(--accent-blue)', 'var(--accent-purple)', 'var(--accent-cyan)',
+    'var(--accent-green)', 'var(--accent-amber)', 'var(--accent-red)',
+    'var(--accent-pink)', '#64748b', '#a78bfa', '#34d399'
+];
 
 function renderFileTypes(types) {
     const container = document.getElementById('storage-types-content');
@@ -165,26 +237,20 @@ function renderFileTypes(types) {
         return;
     }
 
-    const maxSize = types[0].size_bytes;
-    const colors = [
-        'var(--accent-blue)', 'var(--accent-purple)', 'var(--accent-cyan)',
-        'var(--accent-green)', 'var(--accent-amber)', 'var(--accent-red)',
-        'var(--accent-pink)', '#64748b', '#a78bfa', '#34d399'
-    ];
-
+    const maxSize = types[0].size_bytes || 1;
     badge.textContent = `${types.length} categories`;
 
     container.innerHTML = types.map((t, i) => `
         <div class="type-bar-container">
             <div class="type-bar-label">
                 <span class="type-bar-name">
-                    <span class="dot" style="background:${colors[i % colors.length]}"></span>
-                    ${t.category} <span style="color:var(--text-muted);font-size:0.75rem">(${t.count.toLocaleString()} files)</span>
+                    <span class="dot" style="background:${CHART_COLORS[i % CHART_COLORS.length]}"></span>
+                    ${esc(t.category)} <span style="color:var(--text-muted);font-size:0.75rem">(${t.count.toLocaleString()} files)</span>
                 </span>
-                <span class="type-bar-size">${t.size_display}</span>
+                <span class="type-bar-size">${esc(t.size_display)}</span>
             </div>
             <div class="type-bar">
-                <div class="type-bar-fill" style="width:${(t.size_bytes / maxSize * 100).toFixed(1)}%;background:${colors[i % colors.length]}"></div>
+                <div class="type-bar-fill" style="width:${(t.size_bytes / maxSize * 100).toFixed(1)}%;background:${CHART_COLORS[i % CHART_COLORS.length]}"></div>
             </div>
         </div>
     `).join('');
@@ -197,13 +263,13 @@ function renderFolderSizes(folders) {
         return;
     }
 
-    const maxSize = folders[0].size_bytes;
+    const maxSize = folders[0].size_bytes || 1;
 
     container.innerHTML = folders.map(f => `
         <div class="folder-item">
             <span class="folder-icon">📁</span>
-            <span class="folder-name" title="${f.path}">${f.name}</span>
-            <span class="folder-size">${f.size_display}</span>
+            <span class="folder-name" title="${esc(f.path)}">${esc(f.name)}</span>
+            <span class="folder-size">${esc(f.size_display)}</span>
             <div class="folder-bar-wrap">
                 <div class="type-bar">
                     <div class="type-bar-fill" style="width:${(f.size_bytes / maxSize * 100).toFixed(1)}%;background:var(--gradient-cyan, var(--accent-cyan))"></div>
@@ -214,44 +280,88 @@ function renderFolderSizes(folders) {
 }
 
 function renderLargeFiles(files) {
+    lastLargeFiles = files;
     const tbody = document.getElementById('storage-large-files-tbody');
     if (!files.length) {
-        tbody.innerHTML = '<tr><td colspan="4" class="loading-placeholder">No large files found (> 50 MB).</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="loading-placeholder">No large files found (> 50 MB).</td></tr>';
         return;
     }
 
-    tbody.innerHTML = files.map(f => `
+    tbody.innerHTML = files.map((f, i) => `
         <tr>
-            <td title="${f.name}">${truncate(f.name, 40)}</td>
-            <td style="color:var(--accent-amber);font-weight:600">${f.size_display}</td>
-            <td>${f.extension || '—'}</td>
-            <td title="${f.path}">${truncate(f.path, 50)}</td>
+            <td title="${esc(f.name)}">${esc(truncate(f.name, 40))}</td>
+            <td style="color:var(--accent-amber);font-weight:600">${esc(f.size_display)}</td>
+            <td>${esc(f.extension || '—')}</td>
+            <td title="${esc(f.path)}">${esc(truncate(f.path, 50))}</td>
+            <td><button class="btn-action-delete js-delete-large" style="font-size:0.7rem;padding:4px 8px" data-index="${i}">Delete</button></td>
         </tr>
     `).join('');
 }
 
 function renderTempFiles(items) {
+    lastTempItems = items;
     const container = document.getElementById('storage-temp-content');
     const badge = document.getElementById('temp-total-badge');
+    const cleanAll = document.getElementById('btn-clean-all');
 
     if (!items.length) {
-        container.innerHTML = '<div class="loading-placeholder">No temp directories detected.</div>';
+        container.innerHTML = '<div class="loading-placeholder">✅ Nothing to clean — no temp or cache files found.</div>';
         badge.textContent = '0 B';
+        cleanAll.style.display = 'none';
         return;
     }
 
     const totalBytes = items.reduce((s, i) => s + i.size_bytes, 0);
     badge.textContent = formatBytesJS(totalBytes);
+    cleanAll.style.display = '';
 
-    container.innerHTML = items.map(t => `
+    container.innerHTML = items.map((t, i) => `
         <div class="temp-item">
             <div class="temp-info">
-                <span class="temp-name">🗑️ ${t.name}</span>
-                <span class="temp-path">${t.path}</span>
+                <span class="temp-name">🗑️ ${esc(t.name)}${t.needs_admin ? '<span class="temp-admin-note">needs Administrator</span>' : ''}</span>
+                <span class="temp-path">${esc(t.path)}</span>
             </div>
-            <span class="temp-size">${t.size_display}</span>
+            <span class="temp-size">${esc(t.size_display)}</span>
+            <button class="btn-action-delete js-clean-temp" data-index="${i}">🧹 Clean</button>
         </div>
     `).join('');
+}
+
+async function cleanTempItem(item) {
+    const ok = await showConfirm({
+        title: 'Clean Folder?',
+        message: `Delete the contents of "${item.name}" (${item.size_display})?\n\nPath: ${item.path}\n\nFiles that are in use are skipped. The folder itself is kept.`,
+        confirmText: 'Clean Folder',
+    });
+    if (!ok) return null;
+    const result = await postJSON('/api/action/clean-folder', { path: item.path });
+    if (!result) { showToast('error', 'Could not clean the folder.'); return null; }
+    return result;
+}
+
+async function cleanAllTemp() {
+    if (!lastTempItems.length) return;
+    const total = formatBytesJS(lastTempItems.reduce((s, i) => s + i.size_bytes, 0));
+    const ok = await showConfirm({
+        title: 'Clean All Temp & Cache?',
+        message: `Delete the contents of ${lastTempItems.length} temp/cache folders (about ${total})?\n\nFiles that are in use are skipped. Browser caches will be rebuilt as you browse.`,
+        confirmText: 'Clean All',
+    });
+    if (!ok) return;
+
+    const btn = document.getElementById('btn-clean-all');
+    btn.disabled = true;
+    let freed = 0, errors = 0;
+    for (const item of lastTempItems) {
+        const result = await postJSON('/api/action/clean-folder', { path: item.path });
+        if (result && result.success) {
+            freed += result.freed_bytes || 0;
+            errors += result.errors || 0;
+        }
+    }
+    btn.disabled = false;
+    showToast('success', `Freed ${formatBytesJS(freed)}${errors ? ` (${errors} items in use were skipped)` : ''}`);
+    loadStorage();
 }
 
 // ─── PERFORMANCE ─────────────────────────────────────────────
@@ -271,7 +381,6 @@ async function loadPerformance() {
             <div class="detail-item"><span class="detail-label">Frequency</span><span class="detail-value">${cpuInfo.current_freq_mhz} MHz</span></div>
         `;
 
-        // Per-core blocks
         const coresGrid = document.getElementById('perf-cpu-cores');
         coresGrid.innerHTML = cpuInfo.per_cpu_percent.map((pct, i) => {
             const level = pct < 30 ? 'low' : pct < 60 ? 'medium' : pct < 85 ? 'high' : 'critical';
@@ -281,10 +390,10 @@ async function loadPerformance() {
 
     if (memInfo) {
         document.getElementById('perf-mem-details').innerHTML = `
-            <div class="detail-item"><span class="detail-label">Total RAM</span><span class="detail-value">${memInfo.ram.total_display}</span></div>
-            <div class="detail-item"><span class="detail-label">Used</span><span class="detail-value">${memInfo.ram.used_display} (${memInfo.ram.percent_used}%)</span></div>
-            <div class="detail-item"><span class="detail-label">Available</span><span class="detail-value">${memInfo.ram.available_display}</span></div>
-            <div class="detail-item"><span class="detail-label">Swap Used</span><span class="detail-value">${memInfo.swap.used_display} / ${memInfo.swap.total_display}</span></div>
+            <div class="detail-item"><span class="detail-label">Total RAM</span><span class="detail-value">${esc(memInfo.ram.total_display)}</span></div>
+            <div class="detail-item"><span class="detail-label">Used</span><span class="detail-value">${esc(memInfo.ram.used_display)} (${memInfo.ram.percent_used}%)</span></div>
+            <div class="detail-item"><span class="detail-label">Available</span><span class="detail-value">${esc(memInfo.ram.available_display)}</span></div>
+            <div class="detail-item"><span class="detail-label">Swap Used</span><span class="detail-value">${esc(memInfo.swap.used_display)} / ${esc(memInfo.swap.total_display)}</span></div>
         `;
     }
 
@@ -314,7 +423,7 @@ async function loadNetwork() {
 
 async function runPing() {
     const btn = document.getElementById('btn-ping');
-    const host = document.getElementById('ping-host').value || '8.8.8.8';
+    const host = document.getElementById('ping-host').value.trim() || '8.8.8.8';
     const output = document.getElementById('ping-output');
 
     btn.disabled = true;
@@ -341,14 +450,14 @@ function renderNetworkInterfaces(interfaces) {
         return `
             <div class="net-iface">
                 <div class="net-iface-header">
-                    <span class="net-iface-name">${iface.name}</span>
+                    <span class="net-iface-name">${esc(iface.name)}</span>
                     <span class="net-iface-status ${iface.is_up ? 'up' : 'down'}">${iface.is_up ? '● UP' : '● DOWN'}</span>
                 </div>
                 <div class="net-iface-details">
-                    ${ipv4 ? `<span>IP: ${ipv4.address}</span>` : '<span>No IPv4</span>'}
+                    ${ipv4 ? `<span>IP: ${esc(ipv4.address)}</span>` : '<span>No IPv4</span>'}
                     <span>Speed: ${iface.speed_mbps} Mbps</span>
-                    <span>Sent: ${iface.bytes_sent_display || '0 B'}</span>
-                    <span>Received: ${iface.bytes_recv_display || '0 B'}</span>
+                    <span>Sent: ${esc(iface.bytes_sent_display || '0 B')}</span>
+                    <span>Received: ${esc(iface.bytes_recv_display || '0 B')}</span>
                 </div>
             </div>
         `;
@@ -363,14 +472,15 @@ function renderConnections(connections) {
     }
 
     tbody.innerHTML = connections.map(c => {
-        const statusClass = `status-${c.status.toLowerCase().replace('_', '')}`;
+        // Keep the underscore: the stylesheet defines .status-time_wait (it was being stripped).
+        const statusClass = `status-${esc(String(c.status).toLowerCase())}`;
         return `
             <tr>
-                <td>${c.process || '—'}</td>
-                <td>${c.type}</td>
-                <td>${c.local_addr}</td>
-                <td>${c.remote_addr || '—'}</td>
-                <td class="${statusClass}">${c.status}</td>
+                <td>${esc(c.process || '—')}</td>
+                <td>${esc(c.type)}</td>
+                <td>${esc(c.local_addr)}</td>
+                <td>${esc(c.remote_addr || '—')}</td>
+                <td class="${statusClass}">${esc(c.status)}</td>
             </tr>
         `;
     }).join('');
@@ -383,34 +493,75 @@ async function refreshConnections() {
 
 // ─── STARTUP ─────────────────────────────────────────────────
 
+let startupItems = [];
+
 async function loadStartup() {
     const programs = await fetchJSON('/api/startup/programs');
     const badge = document.getElementById('startup-count-badge');
     const tbody = document.getElementById('startup-tbody');
 
     if (!programs || !programs.length) {
+        startupItems = [];
         badge.textContent = '0';
-        tbody.innerHTML = '<tr><td colspan="4" class="loading-placeholder">No startup programs detected.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="loading-placeholder">No startup programs detected.</td></tr>';
         return;
     }
 
-    badge.textContent = `${programs.length} items`;
-    tbody.innerHTML = programs.map(p => `
-        <tr>
-            <td style="font-weight:500">${p.name}</td>
-            <td><span class="badge">${p.scope}</span></td>
-            <td>${p.source}</td>
-            <td title="${p.command}">${truncate(p.command, 50)}</td>
-            <td>${p.source === 'Registry' && (p.scope === 'Current User' || p.scope === 'All Users')
-                ? `<button class="btn-action-delete" style="font-size:0.7rem;padding:4px 8px" onclick="toggleStartup('${escapeHtml(p.name)}', 'disable', '${escapeHtml(p.scope)}', '${escapeHtml(p.location)}')">Disable</button>`
-                : '<span style="color:var(--text-muted)">—</span>'}</td>
-        </tr>
-    `).join('');
+    startupItems = programs;
+    const enabledCount = programs.filter(p => p.enabled !== false).length;
+    const disabledCount = programs.length - enabledCount;
+    badge.textContent = disabledCount ? `${enabledCount} enabled · ${disabledCount} disabled` : `${programs.length} items`;
+
+    tbody.innerHTML = programs.map((p, i) => {
+        const enabled = p.enabled !== false;
+        let action = '<span style="color:var(--text-muted)">—</span>';
+        if (p.toggleable) {
+            action = enabled
+                ? `<button class="btn-action-delete js-startup" style="font-size:0.7rem;padding:4px 8px" data-index="${i}">Disable</button>`
+                : `<button class="btn-action-enable js-startup" data-index="${i}">Enable</button>`;
+        }
+        return `
+        <tr class="${enabled ? '' : 'row-disabled'}">
+            <td style="font-weight:500">${esc(p.name)}${enabled ? '' : ' <span class="badge">Disabled</span>'}</td>
+            <td><span class="badge">${esc(p.scope)}</span></td>
+            <td>${esc(p.source)}</td>
+            <td title="${esc(p.command)}">${esc(truncate(p.command, 50))}</td>
+            <td>${action}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function toggleStartup(item) {
+    const enabling = item.enabled === false;
+    const ok = await showConfirm({
+        title: enabling ? 'Enable Startup Item?' : 'Disable Startup Item?',
+        message: enabling
+            ? `"${item.name}" will start with Windows again.`
+            : `"${item.name}" will no longer start with Windows. You can turn it back on here at any time.`,
+        confirmText: enabling ? 'Enable' : 'Disable',
+        danger: !enabling,
+    });
+    if (!ok) return;
+
+    const result = await postJSON('/api/startup/toggle', {
+        name: item.name,
+        action: enabling ? 'enable' : 'disable',
+        scope: item.scope,
+        location: item.location,
+        source: item.source,
+        key: item.key || item.name,
+    });
+    if (result && result.success) {
+        showToast('success', result.message);
+        loadStartup();
+    } else {
+        showToast('error', (result && result.error) || 'Could not change the startup item.');
+    }
 }
 
 // ─── SHARED RENDERERS ────────────────────────────────────────
 
-function renderDrivesGrid(selector, drives, large = false) {
+function renderDrivesGrid(selector, drives) {
     const container = document.querySelector(selector);
 
     container.innerHTML = drives.map(d => {
@@ -418,42 +569,42 @@ function renderDrivesGrid(selector, drives, large = false) {
         return `
             <div class="drive-card">
                 <div class="drive-header">
-                    <span class="drive-name">${d.mountpoint}</span>
+                    <span class="drive-name">${esc(d.mountpoint)}</span>
                     <span class="drive-percent ${level}">${d.percent_used}%</span>
                 </div>
                 <div class="drive-bar">
                     <div class="drive-bar-fill ${level}" style="width:${d.percent_used}%"></div>
                 </div>
                 <div class="drive-info">
-                    <span>Used: ${d.used_display}</span>
-                    <span>Free: ${d.free_display}</span>
+                    <span>Used: ${esc(d.used_display)}</span>
+                    <span>Free: ${esc(d.free_display)}</span>
                 </div>
                 <div class="drive-info" style="margin-top:4px">
-                    <span>Total: ${d.total_display}</span>
-                    <span>${d.fstype}</span>
+                    <span>Total: ${esc(d.total_display)}</span>
+                    <span>${esc(d.fstype)}</span>
                 </div>
             </div>
         `;
     }).join('');
 }
 
-function renderProcessTable(selector, processes) {
+function renderProcessTable(selector, processes, withKill = true) {
     const tbody = document.querySelector(selector);
     if (!processes.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="loading-placeholder">No processes found.</td></tr>';
+        tbody.innerHTML = `<tr><td colspan="${withKill ? 6 : 5}" class="loading-placeholder">No processes found.</td></tr>`;
         return;
     }
 
     tbody.innerHTML = processes.map(p => {
-        const statusClass = `status-${p.status.toLowerCase()}`;
+        const statusClass = `status-${esc(String(p.status).toLowerCase())}`;
         return `
             <tr>
-                <td style="font-weight:500">${truncate(p.name, 30)}</td>
+                <td style="font-weight:500" title="${esc(p.name)}">${esc(truncate(p.name, 30))}</td>
                 <td>${p.pid}</td>
-                <td style="color:var(--accent-cyan)">${p.memory_display}</td>
+                <td style="color:var(--accent-cyan)">${esc(p.memory_display)}</td>
                 <td>${p.cpu_percent}%</td>
-                <td class="${statusClass}">${p.status}</td>
-                <td><button class="btn-action-delete" style="font-size:0.7rem;padding:4px 8px" onclick="killProcess(${p.pid}, '${escapeHtml(p.name)}')">Kill</button></td>
+                <td class="${statusClass}">${esc(p.status)}</td>
+                ${withKill ? `<td><button class="btn-action-delete js-kill" style="font-size:0.7rem;padding:4px 8px" data-pid="${p.pid}" data-name="${esc(p.name)}">Kill</button></td>` : ''}
             </tr>
         `;
     }).join('');
@@ -463,14 +614,17 @@ function populateDriveSelector(drives) {
     const selector = document.getElementById('drive-selector');
     if (!selector) return;
 
-    const currentValue = selector.value;
-    selector.innerHTML = drives.map(d =>
-        `<option value="${d.mountpoint}">${d.mountpoint} (${d.free_display} free)</option>`
+    const html = drives.map(d =>
+        `<option value="${esc(d.mountpoint)}">${esc(d.mountpoint)} (${esc(d.free_display)} free)</option>`
     ).join('');
+    // The live refresh calls this every few seconds; rebuilding identical options would
+    // close an open dropdown and reset the user's choice.
+    if (selector.dataset.signature === html) return;
 
-    // Preserve previous selection if still valid
-    const options = Array.from(selector.options).map(o => o.value);
-    if (options.includes(currentValue)) {
+    const currentValue = selector.value;
+    selector.innerHTML = html;
+    selector.dataset.signature = html;
+    if (Array.from(selector.options).some(o => o.value === currentValue)) {
         selector.value = currentValue;
     }
 }
@@ -504,16 +658,130 @@ function formatBytesJS(bytes) {
         size /= 1024;
         i++;
     }
-    return `${size.toFixed(2)} ${units[i]}`;
+    return i === 0 ? `${Math.round(size)} B` : `${size.toFixed(2)} ${units[i]}`;
 }
+
+// ─── CONFIRMATION MODAL ──────────────────────────────────────
+
+let modalResolver = null;
+
+function showConfirm({ title, message, confirmText = 'Confirm', danger = true }) {
+    return new Promise(resolve => {
+        if (modalResolver) modalResolver(false);
+        modalResolver = resolve;
+        document.getElementById('modal-title').textContent = title;
+        document.getElementById('modal-message').textContent = message;
+        const btn = document.getElementById('modal-confirm-btn');
+        btn.textContent = confirmText;
+        btn.className = danger ? 'btn-danger' : 'btn-primary';
+        document.getElementById('modal-overlay').style.display = 'flex';
+        btn.focus();
+    });
+}
+
+function modalResolve(value) {
+    document.getElementById('modal-overlay').style.display = 'none';
+    const resolve = modalResolver;
+    modalResolver = null;
+    if (resolve) resolve(value);
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modalResolver) modalResolve(false);
+});
+
+document.getElementById('modal-overlay').addEventListener('click', (e) => {
+    if (e.target.id === 'modal-overlay') modalResolve(false);
+});
+
+// ─── DELETE / CLEAN ACTIONS ──────────────────────────────────
+
+async function deleteFile(file) {
+    const ok = await showConfirm({
+        title: 'Delete File?',
+        message: `Are you sure you want to permanently delete "${file.name}" (${file.size})?\n\nPath: ${file.path}\n\nThis cannot be undone.`,
+        confirmText: 'Delete File',
+    });
+    if (!ok) return null;
+    const result = await postJSON('/api/action/delete-file', { path: file.path });
+    if (!result) { showToast('error', 'Network error — could not complete action.'); return null; }
+    return result;
+}
+
+// Run a chat action button (delete a file / clean a folder) and report in the chat.
+async function runChatAction(action, button) {
+    let result;
+    if (action.type === 'delete_file') {
+        result = await deleteFile(action);
+    } else {
+        result = await cleanTempItem({ name: action.name, size_display: action.size, path: action.path });
+    }
+    if (!result) return;
+
+    if (result.success) {
+        showToast('success', `${result.message} — freed ${result.freed}`);
+        addChatBubble('bot',
+            `Done! ${result.message}\nFreed: ${result.freed}${result.errors ? ` (${result.errors} files couldn't be deleted — may be in use)` : ''}`,
+            'Action Complete');
+        if (button) { button.disabled = true; button.classList.add('done'); }
+    } else {
+        showToast('error', result.error || 'Failed to delete.');
+        addChatBubble('bot', `Failed: ${result.error}`, 'Error');
+    }
+}
+
+// One delegated handler for every dynamically created button.
+document.addEventListener('click', async (e) => {
+    const target = e.target.closest('button');
+    if (!target) return;
+
+    if (target.classList.contains('js-kill')) {
+        killProcess(Number(target.dataset.pid), target.dataset.name);
+    } else if (target.classList.contains('js-startup')) {
+        const item = startupItems[Number(target.dataset.index)];
+        if (item) toggleStartup(item);
+    } else if (target.classList.contains('js-clean-temp')) {
+        const item = lastTempItems[Number(target.dataset.index)];
+        if (!item) return;
+        const result = await cleanTempItem(item);
+        if (result && result.success) {
+            showToast('success', `${result.message} — freed ${result.freed}`);
+            loadStorage();
+        } else if (result) {
+            showToast('error', result.error || 'Could not clean the folder.');
+        }
+    } else if (target.classList.contains('js-delete-large')) {
+        const file = lastLargeFiles[Number(target.dataset.index)];
+        if (!file) return;
+        const result = await deleteFile({ name: file.name, size: file.size_display, path: file.path });
+        if (result && result.success) {
+            showToast('success', `${result.message} — freed ${result.freed}`);
+            lastLargeFiles = lastLargeFiles.filter(f => f.path !== file.path);
+            renderLargeFiles(lastLargeFiles);
+        } else if (result) {
+            showToast('error', result.error || 'Failed to delete.');
+        }
+    } else if (target.classList.contains('js-chat-action')) {
+        const action = chatActions[Number(target.dataset.index)];
+        if (action) runChatAction(action, target);
+    }
+});
 
 // ─── CHAT / DIAGNOSE ─────────────────────────────────────────
 
+const chatActions = [];    // action objects referenced by button index
+let chatHistory = [];      // recent turns, so follow-up questions work in AI mode
+let chatBusy = false;
+
 async function sendChat() {
+    if (chatBusy) return;
     const input = document.getElementById('chat-input');
+    const sendBtn = document.getElementById('btn-send-chat');
     const question = input.value.trim();
     if (!question) return;
 
+    chatBusy = true;
+    sendBtn.disabled = true;
     input.value = '';
     addChatBubble('user', question);
     addTypingIndicator();
@@ -522,14 +790,23 @@ async function sendChat() {
         const res = await fetch(API + '/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ question }),
+            body: JSON.stringify({ question, history: chatHistory.slice(-8) }),
         });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         removeTypingIndicator();
         addBotResponse(data);
+
+        chatHistory.push({ role: 'user', content: question });
+        chatHistory.push({ role: 'assistant', content: data.messages.join('\n').slice(0, 3000) });
+        chatHistory = chatHistory.slice(-16);
     } catch (err) {
         removeTypingIndicator();
         addChatBubble('bot', 'Sorry, something went wrong. Please try again.', 'Error');
+    } finally {
+        chatBusy = false;
+        sendBtn.disabled = false;
+        input.focus();
     }
 }
 
@@ -549,8 +826,8 @@ function addChatBubble(type, text, title = null) {
     bubble.innerHTML = `
         <div class="chat-avatar">${avatar}</div>
         <div class="chat-content">
-            <strong>${label}</strong>
-            <p>${escapeHtml(text)}</p>
+            <strong>${esc(label)}</strong>
+            <p>${esc(text)}</p>
         </div>
     `;
 
@@ -558,34 +835,59 @@ function addChatBubble(type, text, title = null) {
     scrollChatToBottom();
 }
 
+// Minimal, safe markdown: **bold**, `code`, "- " bullets, "# " headings, ``` fences.
+function renderChatLines(rawLines) {
+    let html = '';
+    let inCode = false;
+    let code = [];
+
+    for (const raw of rawLines) {
+        if (raw.trim().startsWith('```')) {
+            if (inCode) {
+                html += `<pre class="chat-code">${esc(code.join('\n'))}</pre>`;
+                code = [];
+            }
+            inCode = !inCode;
+            continue;
+        }
+        if (inCode) { code.push(raw); continue; }
+
+        if (!raw.trim()) {
+            html += '<span class="chat-line spacer"></span>';
+            continue;
+        }
+        if (/^─+$/.test(raw.trim()) || /^-{3,}$/.test(raw.trim())) {
+            html += '<hr style="border:none;border-top:1px solid var(--border-color);margin:8px 0">';
+            continue;
+        }
+
+        let line = esc(raw)
+            .replace(/^(\s*)[-*]\s+/, '$1• ')
+            .replace(/^#{1,6}\s+(.*)$/, '**$1**')
+            .replace(/\*\*(.+?)\*\*/g, '<b style="color:var(--text-primary)">$1</b>')
+            .replace(/`([^`]+)`/g, '<code>$1</code>');
+        html += `<span class="chat-line">${line}</span>`;
+    }
+    if (inCode && code.length) html += `<pre class="chat-code">${esc(code.join('\n'))}</pre>`;
+    return html;
+}
+
 function addBotResponse(data) {
     const messages = document.getElementById('chat-messages');
     const bubble = document.createElement('div');
     bubble.className = 'chat-bubble bot';
 
-    // Render messages with basic markdown-like formatting
-    const renderedLines = data.messages.map(line => {
-        let html = escapeHtml(line);
-        // Bold: **text**
-        html = html.replace(/\*\*(.+?)\*\*/g, '<b style="color:var(--text-primary)">$1</b>');
-        // Code: `text`
-        html = html.replace(/`(.+?)`/g, '<code>$1</code>');
-        // Horizontal rule
-        if (/^─+$/.test(line.trim())) {
-            return '<hr style="border:none;border-top:1px solid var(--border-color);margin:8px 0">';
-        }
-        return `<span class="chat-line">${html}</span>`;
-    }).join('');
+    // Rule-engine replies are arrays of lines (some with a leading "\n" used as spacing);
+    // AI replies are one long markdown string. Split both into lines.
+    const lines = (data.messages || []).flatMap(m => String(m).split('\n'));
+    // Drop empty lines for rule-engine answers (they rely on CSS spacing), keep them for AI text.
+    const rendered = renderChatLines(data.ai_mode ? lines : lines.filter(l => l.trim()));
 
-    // Render action buttons
     let actionsHtml = '';
     if (data.actions && data.actions.length > 0) {
-        const buttons = data.actions.map((action, i) => {
-            const actionId = `action-${Date.now()}-${i}`;
-            const dataAttr = escapeHtml(JSON.stringify(action));
-            return `<button class="btn-action-delete" id="${actionId}" onclick='promptDelete(${JSON.stringify(action).replace(/'/g, "&#39;")})'>
-                🗑️ ${escapeHtml(action.label)}
-            </button>`;
+        const buttons = data.actions.map(action => {
+            const index = chatActions.push(action) - 1;
+            return `<button class="btn-action-delete js-chat-action" data-index="${index}">🗑️ ${esc(action.label)}</button>`;
         }).join('');
         actionsHtml = `<div class="chat-actions">${buttons}</div>`;
     }
@@ -593,8 +895,8 @@ function addBotResponse(data) {
     bubble.innerHTML = `
         <div class="chat-avatar">D</div>
         <div class="chat-content">
-            <strong>${data.title || 'Diagnoser'}</strong>
-            ${renderedLines}
+            <strong>${esc(data.title || 'Diagnoser')}</strong>
+            ${rendered}
             ${actionsHtml}
         </div>
     `;
@@ -631,79 +933,9 @@ function scrollChatToBottom() {
     setTimeout(() => { container.scrollTop = container.scrollHeight; }, 50);
 }
 
-// ─── DELETE / CLEAN ACTIONS ──────────────────────────────────
-
-let pendingAction = null;
-
-function promptDelete(action) {
-    pendingAction = action;
-    const modal = document.getElementById('modal-overlay');
-    const title = document.getElementById('modal-title');
-    const message = document.getElementById('modal-message');
-    const btn = document.getElementById('modal-confirm-btn');
-
-    if (action.type === 'delete_file') {
-        title.textContent = 'Delete File?';
-        message.textContent = `Are you sure you want to permanently delete "${action.name}" (${action.size})?\n\nPath: ${action.path}\n\nThis cannot be undone.`;
-        btn.textContent = 'Delete File';
-    } else if (action.type === 'delete_folder_contents' || action.type === 'delete_folder') {
-        title.textContent = 'Clean Folder?';
-        message.textContent = `Are you sure you want to clean all contents of "${action.name}" (${action.size})?\n\nPath: ${action.path}\n\nThis will delete all files inside this folder.`;
-        btn.textContent = 'Clean Folder';
-    }
-
-    modal.style.display = 'flex';
-}
-
-function closeModal() {
-    document.getElementById('modal-overlay').style.display = 'none';
-    pendingAction = null;
-}
-
-async function confirmModalAction() {
-    if (!pendingAction) return;
-
-    const action = pendingAction;
-    closeModal();
-
-    let endpoint, body;
-
-    if (action.type === 'delete_file') {
-        endpoint = '/api/action/delete-file';
-        body = { path: action.path };
-    } else {
-        endpoint = '/api/action/clean-folder';
-        body = { path: action.path };
-    }
-
-    try {
-        const res = await fetch(API + endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        const result = await res.json();
-
-        if (result.success) {
-            showToast('success', `${result.message} — freed ${result.freed}`);
-            // Update the button that triggered this
-            addChatBubble('bot',
-                `Done! ${result.message}\nFreed: ${result.freed}${result.errors ? ` (${result.errors} files couldn't be deleted — may be in use)` : ''}`,
-                'Action Complete'
-            );
-        } else {
-            showToast('error', result.error || 'Failed to delete.');
-            addChatBubble('bot', `Failed: ${result.error}`, 'Error');
-        }
-    } catch (err) {
-        showToast('error', 'Network error — could not complete action.');
-    }
-}
-
 // ─── TOAST NOTIFICATIONS ─────────────────────────────────────
 
-function showToast(type, message) {
-    // Remove existing toasts
+function showToast(type, message, duration = 4000) {
     document.querySelectorAll('.toast').forEach(t => t.remove());
 
     const toast = document.createElement('div');
@@ -711,19 +943,27 @@ function showToast(type, message) {
     toast.textContent = message;
     document.body.appendChild(toast);
 
-    setTimeout(() => { toast.remove(); }, 4000);
-}
-
-// ─── HELPERS ─────────────────────────────────────────────────
-
-function escapeHtml(str) {
-    if (!str) return '';
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+    setTimeout(() => { toast.remove(); }, duration);
 }
 
 // ─── HEALTH SECTION ──────────────────────────────────────────
+
+function renderCrashRows(crashes, emptyText) {
+    const tbody = document.getElementById('crash-tbody');
+    if (crashes.events && crashes.events.length > 0) {
+        tbody.innerHTML = crashes.events.map(e => {
+            const levelClass = e.level === 'Critical' ? 'color:var(--accent-red)' : 'color:var(--accent-amber)';
+            return `<tr>
+                <td>${esc(e.time)}</td>
+                <td style="${levelClass};font-weight:600">${esc(e.level)}</td>
+                <td>${esc(truncate(e.source, 30))}</td>
+                <td title="${esc(e.message)}">${esc(truncate(e.message, 80))}</td>
+            </tr>`;
+        }).join('');
+    } else {
+        tbody.innerHTML = `<tr><td colspan="4" class="loading-placeholder">${esc(emptyText)}</td></tr>`;
+    }
+}
 
 async function loadHealth() {
     const [temps, battery, disks, crashes, programs] = await Promise.all([
@@ -734,17 +974,11 @@ async function loadHealth() {
         fetchJSON('/api/health/programs'),
     ]);
 
-    // Temperature card
     if (temps) {
-        if (temps.cpu_temp !== null) {
-            setText('#health-temp-value', `${temps.cpu_temp}°C`);
-        } else {
-            setText('#health-temp-value', 'N/A');
-        }
+        setText('#health-temp-value', temps.cpu_temp !== null ? `${temps.cpu_temp}°C` : 'N/A');
         setText('#health-temp-detail', temps.message || 'Unknown');
     }
 
-    // Battery health card
     if (battery) {
         if (battery.health_percent) {
             setText('#health-battery-value', `${battery.health_percent}%`);
@@ -755,30 +989,12 @@ async function loadHealth() {
         setText('#health-battery-detail', battery.message || '');
     }
 
-    // Crash count card
     if (crashes) {
-        const count = crashes.crash_count || 0;
-        setText('#health-crash-value', count.toString());
+        setText('#health-crash-value', String(crashes.crash_count || 0));
         setText('#health-crash-detail', crashes.message || '');
-
-        // Crash table
-        const tbody = document.getElementById('crash-tbody');
-        if (crashes.events && crashes.events.length > 0) {
-            tbody.innerHTML = crashes.events.map(e => {
-                const levelClass = e.level === 'Critical' ? 'color:var(--accent-red)' : 'color:var(--accent-amber)';
-                return `<tr>
-                    <td>${e.time}</td>
-                    <td style="${levelClass};font-weight:600">${e.level}</td>
-                    <td>${truncate(e.source, 30)}</td>
-                    <td title="${escapeHtml(e.message)}">${truncate(e.message, 80)}</td>
-                </tr>`;
-            }).join('');
-        } else {
-            tbody.innerHTML = '<tr><td colspan="4" class="loading-placeholder">✅ No critical errors found in the last 30 days.</td></tr>';
-        }
+        renderCrashRows(crashes, '✅ No crashes or unexpected restarts in the last 30 days.');
     }
 
-    // Disk health
     if (disks) {
         const container = document.getElementById('health-disks-content');
         if (disks.length > 0) {
@@ -787,16 +1003,16 @@ async function loadHealth() {
                             : d.health_level === 'warning' ? 'var(--accent-amber)' : 'var(--accent-red)';
                 return `<div class="net-iface">
                     <div class="net-iface-header">
-                        <span class="net-iface-name">${d.name}</span>
+                        <span class="net-iface-name">${esc(d.name)}</span>
                         <span class="net-iface-status ${d.health_level === 'good' ? 'up' : 'down'}" style="color:${color}">
-                            ● ${d.health_status}
+                            ● ${esc(d.health_status)}
                         </span>
                     </div>
                     <div class="net-iface-details">
-                        <span>Type: ${d.media_type}</span>
-                        <span>Size: ${d.size_display}</span>
-                        <span>Bus: ${d.bus_type}</span>
-                        <span>Status: ${d.operational_status}</span>
+                        <span>Type: ${esc(d.media_type)}</span>
+                        <span>Size: ${esc(d.size_display)}</span>
+                        <span>Bus: ${esc(d.bus_type)}</span>
+                        <span>Status: ${esc(d.operational_status)}</span>
                     </div>
                 </div>`;
             }).join('');
@@ -805,17 +1021,16 @@ async function loadHealth() {
         }
     }
 
-    // Installed programs
     if (programs) {
         const tbody = document.getElementById('programs-tbody');
         const badge = document.getElementById('programs-count-badge');
         badge.textContent = `${programs.length} apps`;
         tbody.innerHTML = programs.map(p => `
             <tr>
-                <td style="font-weight:500">${truncate(p.name, 35)}</td>
-                <td>${p.version || '—'}</td>
-                <td>${truncate(p.publisher || '—', 25)}</td>
-                <td style="color:var(--accent-amber);font-weight:600">${p.size_display}</td>
+                <td style="font-weight:500">${esc(truncate(p.name, 35))}</td>
+                <td>${esc(p.version || '—')}</td>
+                <td>${esc(truncate(p.publisher || '—', 25))}</td>
+                <td style="color:var(--accent-amber);font-weight:600">${esc(p.size_display)}</td>
             </tr>
         `).join('');
     }
@@ -823,25 +1038,18 @@ async function loadHealth() {
 
 async function loadCrashLogs() {
     const crashes = await fetchJSON('/api/health/crashes');
-    if (crashes) {
-        const tbody = document.getElementById('crash-tbody');
-        if (crashes.events && crashes.events.length > 0) {
-            tbody.innerHTML = crashes.events.map(e => {
-                const levelClass = e.level === 'Critical' ? 'color:var(--accent-red)' : 'color:var(--accent-amber)';
-                return `<tr>
-                    <td>${e.time}</td>
-                    <td style="${levelClass};font-weight:600">${e.level}</td>
-                    <td>${truncate(e.source, 30)}</td>
-                    <td title="${escapeHtml(e.message)}">${truncate(e.message, 80)}</td>
-                </tr>`;
-            }).join('');
-        } else {
-            tbody.innerHTML = '<tr><td colspan="4" class="loading-placeholder">✅ No critical errors found.</td></tr>';
-        }
-    }
+    if (crashes) renderCrashRows(crashes, '✅ No crashes found.');
 }
 
 // ─── SECURITY SECTION ────────────────────────────────────────
+
+function setStatusValue(id, text, color) {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.style.color = color;
+    el.style.webkitTextFillColor = color;
+    el.style.background = 'none';
+}
 
 async function loadSecurity() {
     const security = await fetchJSON('/api/security/status');
@@ -851,56 +1059,47 @@ async function loadSecurity() {
     const f = security.firewall;
     const u = security.updates;
 
-    // Defender card
     const defColor = d.status_level === 'good' ? 'var(--accent-green)'
                    : d.status_level === 'danger' ? 'var(--accent-red)' : 'var(--accent-amber)';
-    const defEl = document.getElementById('sec-defender-value');
-    defEl.textContent = d.enabled ? (d.real_time_protection ? '✅ Protected' : '⚠️ Partial') : '❌ Disabled';
-    defEl.style.color = defColor;
-    defEl.style.webkitTextFillColor = defColor;
-    defEl.style.background = 'none';
+    setStatusValue('sec-defender-value',
+        d.enabled ? (d.real_time_protection ? '✅ Protected' : '⚠️ Partial')
+                  : (d.status_level === 'unknown' ? '❔ Unknown' : '❌ Disabled'),
+        defColor);
     setText('#sec-defender-detail', d.message);
 
-    // Firewall card
-    const fwColor = f.status_level === 'good' ? 'var(--accent-green)' : 'var(--accent-red)';
-    const fwEl = document.getElementById('sec-firewall-value');
-    fwEl.textContent = f.all_enabled ? '✅ All ON' : '❌ Partial';
-    fwEl.style.color = fwColor;
-    fwEl.style.webkitTextFillColor = fwColor;
-    fwEl.style.background = 'none';
+    const fwColor = f.status_level === 'good' ? 'var(--accent-green)'
+                  : f.status_level === 'unknown' ? 'var(--accent-amber)' : 'var(--accent-red)';
+    setStatusValue('sec-firewall-value',
+        f.status_level === 'unknown' ? '❔ Unknown' : (f.all_enabled ? '✅ All ON' : '❌ Partial'),
+        fwColor);
     setText('#sec-firewall-detail', f.message);
 
-    // Firewall profiles
     const profilesContainer = document.getElementById('sec-firewall-profiles');
     if (f.profiles && f.profiles.length > 0) {
         profilesContainer.innerHTML = f.profiles.map(p => {
             const icon = p.enabled ? '🟢' : '🔴';
             return `<div class="net-iface">
                 <div class="net-iface-header">
-                    <span class="net-iface-name">${p.name}</span>
+                    <span class="net-iface-name">${esc(p.name)}</span>
                     <span class="net-iface-status ${p.enabled ? 'up' : 'down'}">${icon} ${p.enabled ? 'Enabled' : 'DISABLED'}</span>
                 </div>
             </div>`;
         }).join('');
     }
 
-    // Updates card
     const uColor = u.status_level === 'good' ? 'var(--accent-green)' : 'var(--accent-amber)';
-    const uEl = document.getElementById('sec-updates-value');
-    uEl.textContent = u.status_level === 'good' ? '✅ Up to Date' : '⚠️ Check Updates';
-    uEl.style.color = uColor;
-    uEl.style.webkitTextFillColor = uColor;
-    uEl.style.background = 'none';
+    setStatusValue('sec-updates-value',
+        u.status_level === 'good' ? '✅ Up to Date' : (u.status_level === 'unknown' ? '❔ Unknown' : '⚠️ Check Updates'),
+        uColor);
     setText('#sec-updates-detail', u.message);
 
-    // Recent updates table
     const tbody = document.getElementById('sec-updates-tbody');
     if (u.recent_updates && u.recent_updates.length > 0) {
         tbody.innerHTML = u.recent_updates.map(upd => `
             <tr>
-                <td style="font-weight:600;color:var(--accent-blue)">${upd.id}</td>
-                <td>${upd.description || '—'}</td>
-                <td>${upd.installed_on}</td>
+                <td style="font-weight:600;color:var(--accent-blue)">${esc(upd.id)}</td>
+                <td>${esc(upd.description || '—')}</td>
+                <td>${esc(upd.installed_on)}</td>
             </tr>
         `).join('');
     } else {
@@ -917,7 +1116,7 @@ async function runSpeedTest() {
     btn.textContent = '⏳ Testing...';
     resultDiv.style.display = 'block';
     resultDiv.className = 'speed-result';
-    resultDiv.textContent = 'Running speed test... This may take a few seconds.';
+    resultDiv.textContent = 'Running speed test... This may take up to 15 seconds.';
 
     const result = await fetchJSON('/api/network/speedtest');
 
@@ -926,9 +1125,9 @@ async function runSpeedTest() {
         resultDiv.innerHTML = `
             <div style="display:flex;gap:24px;align-items:center">
                 <div><span style="font-size:2rem;font-weight:800;color:var(--accent-cyan)">${result.download_mbps}</span> <span style="color:var(--text-muted)">Mbps</span></div>
-                <div><span style="font-size:1.2rem;font-weight:600">${result.latency_ms || '—'}</span> <span style="color:var(--text-muted)">ms latency</span></div>
+                <div><span style="font-size:1.2rem;font-weight:600">${result.latency_ms ?? '—'}</span> <span style="color:var(--text-muted)">ms latency</span></div>
             </div>
-            <div style="margin-top:8px;color:var(--text-muted);font-size:0.8rem">Downloaded ${result.download_size} in ${result.download_time}s</div>
+            <div style="margin-top:8px;color:var(--text-muted);font-size:0.8rem">Downloaded ${esc(result.download_size)} in ${result.download_time}s</div>
         `;
     } else {
         resultDiv.className = 'speed-result error';
@@ -942,23 +1141,19 @@ async function runSpeedTest() {
 // ─── KILL PROCESS ────────────────────────────────────────────
 
 async function killProcess(pid, name) {
-    if (!confirm(`Kill process "${name}" (PID: ${pid})?`)) return;
+    const ok = await showConfirm({
+        title: 'Kill Process?',
+        message: `Terminate "${name}" (PID ${pid})?\n\nUnsaved work in that program will be lost.`,
+        confirmText: 'Kill Process',
+    });
+    if (!ok) return;
 
-    try {
-        const res = await fetch(API + '/api/tools/kill-process', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pid }),
-        });
-        const result = await res.json();
-        if (result.success) {
-            showToast('success', result.message);
-            refreshProcesses();
-        } else {
-            showToast('error', result.error);
-        }
-    } catch (err) {
-        showToast('error', 'Could not kill process.');
+    const result = await postJSON('/api/tools/kill-process', { pid });
+    if (result && result.success) {
+        showToast('success', result.message);
+        refreshProcesses();
+    } else {
+        showToast('error', (result && result.error) || 'Could not kill process.');
     }
 }
 
@@ -968,56 +1163,25 @@ async function systemBoost() {
     const btn = document.getElementById('btn-boost');
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Boosting...'; }
 
-    try {
-        const res = await fetch(API + '/api/tools/system-boost', { method: 'POST' });
-        const result = await res.json();
-        if (result.success) {
-            showToast('success', result.message);
-        } else {
-            showToast('error', 'Boost failed.');
-        }
-    } catch (err) {
-        showToast('error', 'Could not run system boost.');
+    const result = await postJSON('/api/tools/system-boost');
+    if (result && result.success) {
+        showToast('success', result.message, 6000);
+    } else {
+        showToast('error', 'Boost failed.');
     }
 
     if (btn) { btn.disabled = false; btn.textContent = '⚡ System Boost'; }
 }
 
-// ─── STARTUP TOGGLE ──────────────────────────────────────────
-
-async function toggleStartup(name, action, scope, location) {
-    if (!confirm(`${action === 'disable' ? 'Disable' : 'Enable'} startup item "${name}"?`)) return;
-
-    try {
-        const res = await fetch(API + '/api/startup/toggle', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, action, scope, location }),
-        });
-        const result = await res.json();
-        if (result.success) {
-            showToast('success', result.message);
-            loadStartup();
-        } else {
-            showToast('error', result.error);
-        }
-    } catch (err) {
-        showToast('error', 'Could not toggle startup item.');
-    }
-}
-
-// ─── INIT ────────────────────────────────────────────────────
 // ─── SETTINGS ────────────────────────────────────────────────
 
 let presetsData = {};
 
 async function loadSettings() {
-    // Load presets
     const presets = await fetchJSON('/api/config/presets');
     if (presets) {
         presetsData = presets;
         const select = document.getElementById('settings-provider');
-        // Keep the default option
         select.innerHTML = '<option value="">-- Choose a provider --</option>';
         for (const [key, preset] of Object.entries(presets)) {
             const opt = document.createElement('option');
@@ -1027,11 +1191,9 @@ async function loadSettings() {
         }
     }
 
-    // Load current config
     const config = await fetchJSON('/api/config');
     if (config) {
         if (config.ai_provider) {
-            // Try to match to a preset
             const providerKey = Object.keys(presetsData).find(
                 k => presetsData[k].label === config.ai_provider
             ) || '';
@@ -1045,8 +1207,10 @@ async function loadSettings() {
             document.getElementById('settings-api-key').placeholder = `Current: ${config.api_key_masked}`;
         }
 
+        // ai_active is what the server really uses. Local models (Ollama / LM Studio) have no
+        // key, so "enabled && has_key" wrongly showed them as "Not Configured".
         const badge = document.getElementById('settings-status-badge');
-        if (config.ai_enabled && config.has_key) {
+        if (config.ai_active) {
             badge.textContent = 'Active';
             badge.className = 'badge success';
         } else {
@@ -1054,14 +1218,12 @@ async function loadSettings() {
             badge.className = 'badge';
         }
 
-        // Update AI badge in chat section
-        updateAiBadge(config.ai_enabled && config.has_key, config.ai_provider);
+        updateAiBadge(config.ai_active, config.ai_provider);
     }
 }
 
 function onProviderChange() {
-    const select = document.getElementById('settings-provider');
-    const key = select.value;
+    const key = document.getElementById('settings-provider').value;
     if (!key || !presetsData[key]) return;
 
     const preset = presetsData[key];
@@ -1069,8 +1231,6 @@ function onProviderChange() {
     document.getElementById('settings-model').value = preset.model_name || '';
     document.getElementById('settings-format').value = preset.api_format || 'openai';
 
-    // Show/hide API key field based on needs_key
-    const keyGroup = document.getElementById('settings-key-group');
     if (!preset.needs_key) {
         document.getElementById('settings-key-hint').textContent = 'No API key needed for this provider';
         document.getElementById('settings-api-key').placeholder = 'Not required';
@@ -1105,21 +1265,13 @@ async function saveSettings() {
     };
     if (apiKey) body.api_key = apiKey;
 
-    try {
-        const res = await fetch(API + '/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        const result = await res.json();
-        if (result.success) {
-            showToast('success', 'Settings saved! AI mode is now active.');
-            loadSettings(); // Refresh UI
-        } else {
-            showToast('error', result.message || 'Failed to save.');
-        }
-    } catch (err) {
-        showToast('error', 'Could not save settings.');
+    const result = await postJSON('/api/config', body);
+    if (result && result.success) {
+        showToast('success', 'Settings saved! AI mode is now active.');
+        document.getElementById('settings-api-key').value = '';
+        loadSettings();
+    } else {
+        showToast('error', (result && result.message) || 'Failed to save.');
     }
 }
 
@@ -1130,20 +1282,16 @@ async function testConnection() {
     btn.disabled = true;
     resultDiv.style.display = 'none';
 
-    try {
-        const res = await fetch(API + '/api/config/test', { method: 'POST' });
-        const result = await res.json();
+    const result = await postJSON('/api/config/test');
 
-        resultDiv.style.display = 'block';
-        if (result.success) {
-            resultDiv.className = 'test-result success';
-            resultDiv.textContent = `✅ ${result.message} — "${result.response}"`;
-        } else {
-            resultDiv.className = 'test-result error';
-            resultDiv.textContent = `❌ ${result.error}`;
-        }
-    } catch (err) {
-        resultDiv.style.display = 'block';
+    resultDiv.style.display = 'block';
+    if (result && result.success) {
+        resultDiv.className = 'test-result success';
+        resultDiv.textContent = `✅ ${result.message} — "${result.response}"`;
+    } else if (result) {
+        resultDiv.className = 'test-result error';
+        resultDiv.textContent = `❌ ${result.error}`;
+    } else {
         resultDiv.className = 'test-result error';
         resultDiv.textContent = '❌ Could not reach the server.';
     }
@@ -1173,35 +1321,22 @@ function updateAiBadge(isActive, providerName) {
 
 document.addEventListener('DOMContentLoaded', () => {
     loadOverview();
-    // Load settings status for AI badge
     fetchJSON('/api/config').then(config => {
-        if (config) {
-            updateAiBadge(config.ai_enabled && config.has_key, config.ai_provider);
-        }
+        if (config) updateAiBadge(config.ai_active, config.ai_provider);
     });
-    // Init version and check for updates
     initVersionAndUpdates();
 });
 
 // ─── UPDATES ──────────────────────────────────────────────────
-let currentAppVersion = "2.0.0"; // default fallback
 
 async function initVersionAndUpdates() {
-    try {
-        const data = await fetchJSON('/api/version');
-        if (data && data.version) {
-            currentAppVersion = data.version;
-            const versionTags = document.querySelectorAll('#version-tag, #settings-current-version');
-            versionTags.forEach(tag => {
-                tag.textContent = 'v' + currentAppVersion;
-            });
-        }
-    } catch (e) {
-        console.error("Failed to fetch version", e);
+    const data = await fetchJSON('/api/version');
+    if (data && data.version) {
+        document.querySelectorAll('#version-tag, #settings-current-version').forEach(tag => {
+            tag.textContent = 'v' + data.version;
+        });
     }
-    
-    // Background check for updates (silent)
-    checkForUpdates(false);
+    checkForUpdates(false);  // background check (silent)
 }
 
 async function checkForUpdates(manual = false) {
@@ -1236,16 +1371,18 @@ async function checkForUpdates(manual = false) {
                 latestText.textContent = 'v' + data.latest_version;
             }
             if (installBtn) installBtn.style.display = 'inline-block';
-            
-            // Show top banner
             if (banner && bannerText) {
                 bannerText.textContent = `🚀 A new version (v${data.latest_version}) is available!`;
                 banner.style.display = 'flex';
             }
-            
-            if (manual) {
-                showToast('success', `Version v${data.latest_version} is available!`);
+            if (manual) showToast('success', `Version v${data.latest_version} is available!`);
+        } else if (!data || data.error) {
+            // The check itself failed (offline, rate limit...). Do not claim "Up to Date".
+            if (badge) {
+                badge.className = 'badge offline';
+                badge.textContent = 'Unavailable';
             }
+            if (manual) showToast('error', (data && data.error) || 'Failed to check for updates.');
         } else {
             if (badge) {
                 badge.className = 'badge';
@@ -1254,18 +1391,7 @@ async function checkForUpdates(manual = false) {
             if (latestContainer) latestContainer.style.display = 'none';
             if (installBtn) installBtn.style.display = 'none';
             if (banner) banner.style.display = 'none';
-            
-            if (manual) {
-                showToast('info', 'You are running the latest version.');
-            }
-        }
-    } catch (err) {
-        if (badge) {
-            badge.className = 'badge offline';
-            badge.textContent = 'Error';
-        }
-        if (manual) {
-            showToast('error', 'Failed to check for updates.');
+            if (manual) showToast('info', 'You are running the latest version.');
         }
     } finally {
         if (btn) {
@@ -1279,8 +1405,14 @@ async function installUpdate() {
     const installBtn = document.getElementById('btn-install-update');
     const bannerBtn = document.getElementById('btn-update-install');
     const resultDiv = document.getElementById('update-result');
-    
+
     const updateButtons = [installBtn, bannerBtn];
+    const restoreButtons = () => updateButtons.forEach(btn => {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = btn === installBtn ? '⬆ Install Update' : '⬆ Update Now';
+        }
+    });
     updateButtons.forEach(btn => {
         if (btn) {
             btn.disabled = true;
@@ -1294,40 +1426,20 @@ async function installUpdate() {
         resultDiv.textContent = '📥 Downloading and installing update... The application will restart automatically.';
     }
 
-    try {
-        const res = await fetch(API + '/api/update/install', { method: 'POST' });
-        const result = await res.json();
-        
-        if (result.success) {
-            showToast('success', 'Update downloaded! Restarting...');
-            if (resultDiv) {
-                resultDiv.textContent = '✅ Update complete! Restarting...';
-            }
-        } else {
-            showToast('error', result.error || 'Failed to install update.');
-            if (resultDiv) {
-                resultDiv.className = 'test-result error';
-                resultDiv.textContent = '❌ Error: ' + result.error;
-            }
-            updateButtons.forEach(btn => {
-                if (btn) {
-                    btn.disabled = false;
-                    btn.textContent = btn === installBtn ? '⬆ Install Update' : 'Update Now';
-                }
-            });
-        }
-    } catch (err) {
-        showToast('error', 'Connection lost during update.');
+    const result = await postJSON('/api/update/install');
+    if (result && result.success) {
+        showToast('success', 'Update downloaded! Restarting...');
+        if (resultDiv) resultDiv.textContent = '✅ Update downloaded! Restarting...';
+    } else {
+        // A successful install shuts the server down, so a missing reply is only an error
+        // when nothing at all came back before the update started.
+        const message = (result && result.error) || 'Connection lost during update.';
+        showToast('error', message);
         if (resultDiv) {
             resultDiv.className = 'test-result error';
-            resultDiv.textContent = '❌ Connection lost.';
+            resultDiv.textContent = '❌ ' + message;
         }
-        updateButtons.forEach(btn => {
-            if (btn) {
-                btn.disabled = false;
-                btn.textContent = btn === installBtn ? '⬆ Install Update' : 'Update Now';
-            }
-        });
+        restoreButtons();
     }
 }
 

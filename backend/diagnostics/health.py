@@ -5,15 +5,19 @@ and BSOD/crash log analysis.
 """
 
 import os
-import subprocess
-import json
-import platform
+import re
+
 import psutil
-from datetime import datetime, timedelta
+
+from diagnostics.utils import format_bytes, ttl_cache
+from diagnostics.winutil import powershell_json, run_hidden
+
+_format_bytes = format_bytes
 
 
 # ─── TEMPERATURE MONITORING ──────────────────────────────────
 
+@ttl_cache(10)
 def get_temperatures():
     """
     Get CPU/GPU temperatures using Windows WMI via PowerShell.
@@ -26,53 +30,46 @@ def get_temperatures():
         "available": False,
     }
 
-    # Try WMI via PowerShell for thermal zone info
+    # MSAcpi_ThermalZoneTemperature (usually needs admin, but worth trying)
+    data = powershell_json(
+        "Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature | "
+        "Select-Object InstanceName, CurrentTemperature | ConvertTo-Json -Compress",
+        timeout=10,
+    ) or []
+    zone_temps = []
+    for sensor in data:
+        try:
+            celsius = round((float(sensor.get("CurrentTemperature") or 0) / 10.0) - 273.15, 1)  # tenths of Kelvin
+        except (TypeError, ValueError):
+            continue
+        if 0 < celsius < 120:  # sanity check
+            zone_temps.append(celsius)
+            temps["sensors"].append({
+                "name": sensor.get("InstanceName", "Thermal Zone"),
+                "temperature_c": celsius,
+                "temperature_f": round(celsius * 9 / 5 + 32, 1),
+            })
+            temps["available"] = True
+    if zone_temps:
+        temps["cpu_temp"] = max(zone_temps)  # the hottest zone is the one that matters
+
+    # psutil sensors (not available on Windows, works on some other systems)
     try:
-        # MSAcpi_ThermalZoneTemperature (requires admin, but worth trying)
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature "
-             "2>$null | Select-Object InstanceName, CurrentTemperature | ConvertTo-Json"],
-            capture_output=True, text=True, timeout=8
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            if not isinstance(data, list):
-                data = [data]
-            for sensor in data:
-                # Temperature is in tenths of Kelvin
-                kelvin_tenths = sensor.get("CurrentTemperature", 0)
-                celsius = round((kelvin_tenths / 10.0) - 273.15, 1)
-                if 0 < celsius < 120:  # sanity check
-                    temps["sensors"].append({
-                        "name": sensor.get("InstanceName", "Thermal Zone"),
-                        "temperature_c": celsius,
-                        "temperature_f": round(celsius * 9/5 + 32, 1),
-                    })
-                    if temps["cpu_temp"] is None:
-                        temps["cpu_temp"] = celsius
-                    temps["available"] = True
+        for name, entries in (psutil.sensors_temperatures() or {}).items():
+            for entry in entries:
+                temps["sensors"].append({
+                    "name": f"{name}: {entry.label or 'sensor'}",
+                    "temperature_c": entry.current,
+                    "temperature_f": round(entry.current * 9 / 5 + 32, 1),
+                    "high": entry.high,
+                    "critical": entry.critical,
+                })
+                temps["available"] = True
+                if temps["cpu_temp"] is None:
+                    temps["cpu_temp"] = entry.current
     except Exception:
         pass
 
-    # Try psutil sensors (works on some systems)
-    try:
-        sensor_temps = psutil.sensors_temperatures()
-        if sensor_temps:
-            for name, entries in sensor_temps.items():
-                for entry in entries:
-                    temps["sensors"].append({
-                        "name": f"{name}: {entry.label or 'sensor'}",
-                        "temperature_c": entry.current,
-                        "temperature_f": round(entry.current * 9/5 + 32, 1),
-                        "high": entry.high,
-                        "critical": entry.critical,
-                    })
-                    temps["available"] = True
-    except (AttributeError, Exception):
-        pass
-
-    # Determine thermal status
     if temps["cpu_temp"] is not None:
         t = temps["cpu_temp"]
         if t > 90:
@@ -96,6 +93,7 @@ def get_temperatures():
 
 # ─── BATTERY HEALTH / DEGRADATION ────────────────────────────
 
+@ttl_cache(60)
 def get_battery_health():
     """
     Generate and parse a Windows battery report to determine
@@ -111,7 +109,10 @@ def get_battery_health():
         "message": "Battery health data unavailable.",
     }
 
-    battery = psutil.sensors_battery()
+    try:
+        battery = psutil.sensors_battery()
+    except Exception:
+        battery = None
     if battery is None:
         result["message"] = "No battery detected — this may be a desktop PC."
         return result
@@ -120,20 +121,14 @@ def get_battery_health():
     result["current_percent"] = battery.percent
     result["power_plugged"] = battery.power_plugged
 
-    # Generate battery report
-    report_path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "battery-report.xml")
+    report_path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), f"diagnoser-battery-{os.getpid()}.xml")
     try:
-        subprocess.run(
-            ["powercfg", "/batteryreport", "/xml", "/output", report_path],
-            capture_output=True, text=True, timeout=10
-        )
+        run_hidden(["powercfg", "/batteryreport", "/xml", "/output", report_path], timeout=15)
 
         if os.path.exists(report_path):
             with open(report_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
 
-            # Parse design capacity
-            import re
             design_match = re.search(r"<DesignCapacity>(\d+)</DesignCapacity>", content)
             full_match = re.search(r"<FullChargeCapacity>(\d+)</FullChargeCapacity>", content)
             cycle_match = re.search(r"<CycleCount>(\d+)</CycleCount>", content)
@@ -165,212 +160,185 @@ def get_battery_health():
 
             if cycle_match:
                 result["cycle_count"] = int(cycle_match.group(1))
-
-            # Cleanup
-            try:
-                os.remove(report_path)
-            except OSError:
-                pass
-
+        else:
+            result["message"] = "Could not generate battery report. Try running as Administrator."
     except Exception:
         result["message"] = "Could not generate battery report. Try running as Administrator."
+    finally:
+        try:
+            os.remove(report_path)
+        except OSError:
+            pass
 
     return result
 
 
 # ─── DISK SMART HEALTH ───────────────────────────────────────
 
+# Windows PowerShell 5.1 serialises these enums as numbers; the script below asks for
+# the names, and these maps cover the numeric case as a fallback.
+_HEALTH_NAMES = {0: "Healthy", 1: "Warning", 2: "Unhealthy", 5: "Unknown"}
+_MEDIA_NAMES = {0: "Unspecified", 3: "HDD", 4: "SSD", 5: "SCM"}
+_BUS_NAMES = {
+    0: "Unknown", 1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "IEEE 1394", 5: "SSA", 6: "Fibre Channel",
+    7: "USB", 8: "RAID", 9: "iSCSI", 10: "SAS", 11: "SATA", 12: "SD", 13: "MMC", 14: "MAX",
+    15: "File Backed Virtual", 16: "Storage Spaces", 17: "NVMe", 18: "Microsoft Reserved",
+}
+
+
+def _name_of(value, mapping):
+    if isinstance(value, int):
+        return mapping.get(value, str(value))
+    return str(value) if value not in (None, "") else "Unknown"
+
+
+@ttl_cache(120)
 def get_disk_health():
-    """
-    Check disk health status using PowerShell's Get-PhysicalDisk.
-    Works on Windows 10/11 without admin rights.
-    """
+    """Check disk health status using PowerShell's Get-PhysicalDisk (no admin needed)."""
+    data = powershell_json(
+        "Get-PhysicalDisk | Select-Object FriendlyName, Size, "
+        "@{n='Media';e={\"$($_.MediaType)\"}}, "
+        "@{n='Health';e={\"$($_.HealthStatus)\"}}, "
+        "@{n='Op';e={($_.OperationalStatus | ForEach-Object { \"$_\" }) -join ', '}}, "
+        "@{n='Bus';e={\"$($_.BusType)\"}} | ConvertTo-Json -Compress",
+        timeout=15,
+    ) or []
+
     disks = []
+    for disk in data:
+        size_bytes = disk.get("Size", 0) or 0
+        health = _name_of(disk.get("Health"), _HEALTH_NAMES)
 
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, "
-             "OperationalStatus, Size, BusType | ConvertTo-Json"],
-            capture_output=True, text=True, timeout=10
-        )
+        if health == "Healthy":
+            level = "good"
+        elif health in ("Unhealthy",):
+            level = "danger"
+        else:  # Warning, Degraded, Unknown...
+            level = "warning"
 
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            if not isinstance(data, list):
-                data = [data]
-
-            for disk in data:
-                size_bytes = disk.get("Size", 0) or 0
-                health = disk.get("HealthStatus", "Unknown")
-                status = disk.get("OperationalStatus", "Unknown")
-
-                health_level = "good"
-                if health in ("Warning", "Degraded"):
-                    health_level = "warning"
-                elif health in ("Unhealthy", "Unknown"):
-                    health_level = "danger"
-
-                disks.append({
-                    "name": disk.get("FriendlyName", "Unknown Disk"),
-                    "media_type": _media_type_str(disk.get("MediaType", 0)),
-                    "health_status": health,
-                    "operational_status": status,
-                    "size_bytes": size_bytes,
-                    "size_display": _format_bytes(size_bytes),
-                    "bus_type": _bus_type_str(disk.get("BusType", 0)),
-                    "health_level": health_level,
-                })
-
-    except Exception:
-        pass
-
+        disks.append({
+            "name": disk.get("FriendlyName") or "Unknown Disk",
+            "media_type": _name_of(disk.get("Media"), _MEDIA_NAMES),
+            "health_status": health,
+            "operational_status": disk.get("Op") or "Unknown",
+            "size_bytes": size_bytes,
+            "size_display": format_bytes(size_bytes),
+            "bus_type": _name_of(disk.get("Bus"), _BUS_NAMES),
+            "health_level": level,
+        })
     return disks
 
 
 # ─── CRASH / BSOD LOG ANALYSIS ───────────────────────────────
 
+# The previous query returned *any* Error/Critical System event, which is never empty on a
+# healthy PC (service timeouts, DCOM...) and was reported as "crashes". This one only
+# looks at events that mean something actually went down.
+_CRASH_SCRIPT = r"""
+$start = (Get-Date).AddDays(-30)
+$items = @()
+$items += Get-WinEvent -FilterHashtable @{LogName='System'; Id=41,6008; StartTime=$start} -MaxEvents 30
+$items += Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'; Id=1001; StartTime=$start} -MaxEvents 30
+$items += Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-WHEA-Logger'; StartTime=$start} -MaxEvents 10
+$items += Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error','Application Hang'; StartTime=$start} -MaxEvents 30
+@($items | Where-Object { $_ } | Sort-Object TimeCreated -Descending | Select-Object -First 30 `
+  @{n='Time';e={$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}, Id, LevelDisplayName, ProviderName, `
+  @{n='Msg';e={ ("$($_.Message)" -split "`n")[0] }}) | ConvertTo-Json -Compress
+"""
+
+
+def _classify_event(event_id, provider):
+    provider = provider or ""
+    if "WHEA" in provider:
+        return "Hardware error", "Critical"
+    if event_id == 41:
+        return "Unexpected restart", "Critical"
+    if event_id == 1001 and "SystemErrorReporting" in provider:
+        return "Blue screen (BSOD)", "Critical"
+    if event_id == 6008:
+        return "Unexpected shutdown", "Error"
+    if provider == "Application Hang":
+        return "App hang", "Warning"
+    return "App crash", "Warning"
+
+
+@ttl_cache(120)
 def get_crash_logs():
-    """
-    Read Windows Event Viewer for recent crashes, BSODs, and critical errors.
-    """
+    """Recent real crashes: BSODs, unexpected restarts, hardware errors, app crashes/hangs."""
+    data = powershell_json(_CRASH_SCRIPT, timeout=30)
+
     crashes = []
+    system_level = 0
+    for event in data or []:
+        kind, level = _classify_event(event.get("Id"), event.get("ProviderName"))
+        if not kind.startswith("App"):
+            system_level += 1
+        text = (event.get("Msg") or "").strip()
+        message = f"{kind}: {text}" if text else kind
+        if len(message) > 300:
+            message = message[:300] + "..."
+        crashes.append({
+            "time": event.get("Time") or "Unknown",
+            "event_id": event.get("Id", 0),
+            "level": level,
+            "source": event.get("ProviderName") or "Unknown",
+            "message": message,
+            "kind": kind,
+        })
 
-    try:
-        # Query for BugCheck (BSOD) events — Event ID 1001 from BugCheck
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2; "
-             "StartTime=(Get-Date).AddDays(-30)} -MaxEvents 20 2>$null | "
-             "Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message | "
-             "ConvertTo-Json"],
-            capture_output=True, text=True, timeout=15
-        )
-
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            if not isinstance(data, list):
-                data = [data]
-
-            for event in data:
-                time_raw = event.get("TimeCreated", "")
-                # Parse the /Date(...)/ format
-                time_str = _parse_win_date(time_raw)
-                message = event.get("Message", "")
-                if message and len(message) > 300:
-                    message = message[:300] + "..."
-
-                crashes.append({
-                    "time": time_str,
-                    "event_id": event.get("Id", 0),
-                    "level": event.get("LevelDisplayName", "Unknown"),
-                    "source": event.get("ProviderName", "Unknown"),
-                    "message": message,
-                })
-    except Exception:
-        pass
+    if data is None:
+        message = "Could not read the Windows Event Log. Try running as Administrator."
+    elif not crashes:
+        message = "No crashes, blue screens or unexpected restarts in the last 30 days. Your system is stable!"
+    else:
+        message = (f"{system_level} system-level crash event(s) and {len(crashes) - system_level} "
+                   f"application crash/hang event(s) in the last 30 days.")
 
     return {
         "crash_count": len(crashes),
+        "system_crash_count": system_level,
         "events": crashes,
-        "message": f"Found {len(crashes)} critical/error events in the last 30 days." if crashes
-                   else "No critical errors or BSODs found in the last 30 days. Your system is stable!",
+        "message": message,
     }
 
 
 # ─── INSTALLED PROGRAMS ──────────────────────────────────────
 
+_PROGRAMS_SCRIPT = r"""
+$paths = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+         'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+Get-ItemProperty $paths | Where-Object { $_.DisplayName -and -not $_.SystemComponent -and -not $_.ParentKeyName } |
+  Select-Object DisplayName, DisplayVersion, Publisher, EstimatedSize, InstallDate | ConvertTo-Json -Compress
+"""
+
+
+@ttl_cache(300)
 def get_installed_programs():
-    """
-    List installed programs sorted by estimated size.
-    """
-    programs = []
+    """List installed programs (machine-wide and per-user) sorted by estimated size."""
+    data = powershell_json(_PROGRAMS_SCRIPT, timeout=20) or []
 
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* , "
-             "HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* 2>$null | "
-             "Where-Object { $_.DisplayName } | "
-             "Select-Object DisplayName, DisplayVersion, Publisher, EstimatedSize, InstallDate | "
-             "Sort-Object -Property EstimatedSize -Descending | "
-             "Select-Object -First 50 | ConvertTo-Json"],
-            capture_output=True, text=True, timeout=15
-        )
-
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            if not isinstance(data, list):
-                data = [data]
-
-            for prog in data:
-                est_size_kb = prog.get("EstimatedSize", 0) or 0
-                size_bytes = est_size_kb * 1024
-
-                programs.append({
-                    "name": prog.get("DisplayName", "Unknown"),
-                    "version": prog.get("DisplayVersion", ""),
-                    "publisher": prog.get("Publisher", ""),
-                    "size_bytes": size_bytes,
-                    "size_display": _format_bytes(size_bytes) if size_bytes > 0 else "Unknown",
-                    "install_date": prog.get("InstallDate", ""),
-                })
-    except Exception:
-        pass
-
-    return programs
-
-
-# ─── HELPERS ─────────────────────────────────────────────────
-
-def _parse_win_date(date_val):
-    """Parse Windows JSON date format /Date(milliseconds)/."""
-    if date_val is None:
-        return "Unknown"
-    if isinstance(date_val, dict):
-        if 'DateTime' in date_val:
-            dt_str = date_val['DateTime']
-            try:
-                dt = datetime.strptime(dt_str, "%A, %B %d, %Y %I:%M:%S %p")
-                return dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                return str(dt_str)
-        if 'value' in date_val:
-            return _parse_win_date(date_val['value'])
-        return str(date_val)
-    if isinstance(date_val, str) and "Date(" in date_val:
+    programs = {}
+    for prog in data:
+        name = prog.get("DisplayName")
+        if not name:
+            continue
         try:
-            import re
-            ms = int(re.search(r"Date\((\d+)\)", date_val).group(1))
-            dt = datetime.fromtimestamp(ms / 1000)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return str(date_val)
-    return str(date_val) if date_val else "Unknown"
+            size_bytes = int(prog.get("EstimatedSize") or 0) * 1024  # registry value is in KB
+        except (TypeError, ValueError):
+            size_bytes = 0
+        version = prog.get("DisplayVersion") or ""
+        entry = {
+            "name": name,
+            "version": version,
+            "publisher": prog.get("Publisher") or "",
+            "size_bytes": size_bytes,
+            "size_display": format_bytes(size_bytes) if size_bytes > 0 else "Unknown",
+            "install_date": prog.get("InstallDate") or "",
+        }
+        key = (name.lower(), version)  # the same app often appears in both 32- and 64-bit keys
+        if key not in programs or size_bytes > programs[key]["size_bytes"]:
+            programs[key] = entry
 
-
-def _media_type_str(val):
-    """Convert MediaType integer to readable string."""
-    mapping = {0: "Unspecified", 3: "HDD", 4: "SSD", 5: "SCM"}
-    return mapping.get(val, str(val))
-
-
-def _bus_type_str(val):
-    """Convert BusType integer to readable string."""
-    mapping = {
-        0: "Unknown", 1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "IEEE 1394",
-        5: "SSA", 6: "Fibre Channel", 7: "USB", 8: "RAID",
-        9: "iSCSI", 10: "SAS", 11: "SATA", 12: "SD", 13: "MMC",
-        14: "MAX", 15: "File Backed Virtual", 16: "Storage Spaces",
-        17: "NVMe", 18: "Microsoft Reserved",
-    }
-    return mapping.get(val, str(val))
-
-
-def _format_bytes(size: int) -> str:
-    """Convert bytes to a human-readable format."""
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} PB"
+    ordered = sorted(programs.values(), key=lambda p: (-p["size_bytes"], p["name"].lower()))
+    return ordered[:50]

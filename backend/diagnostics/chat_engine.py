@@ -4,6 +4,7 @@ Rule-based system intelligence that analyzes your PC and answers questions.
 No AI/LLM needed — pure diagnostic logic.
 """
 
+import os
 import re
 from diagnostics import storage, system, network, startup, health, security, tools
 
@@ -113,6 +114,19 @@ INTENTS = [
 ]
 
 
+def _compile_keywords():
+    """Pre-compile whole-word patterns. Plain substring matching made "ram" match "program",
+    "hot" match "photo", and "why is my computer slow" match the storage intent ("why is my c")."""
+    compiled = []
+    for intent in INTENTS:
+        patterns = [(kw, re.compile(r"(?<!\w)" + re.escape(kw) + r"(?!\w)")) for kw in intent["keywords"]]
+        compiled.append((intent, patterns))
+    return compiled
+
+
+_COMPILED_INTENTS = _compile_keywords()
+
+
 def detect_intent(question: str) -> dict:
     """Detect the user's intent from their question."""
     q = question.lower().strip()
@@ -120,13 +134,8 @@ def detect_intent(question: str) -> dict:
     best_match = None
     best_score = 0
 
-    for intent in INTENTS:
-        score = 0
-        for kw in intent["keywords"]:
-            if kw in q:
-                # Longer keyword matches get higher score
-                score += len(kw)
-
+    for intent, patterns in _COMPILED_INTENTS:
+        score = sum(len(kw) for kw, pattern in patterns if pattern.search(q))  # longer keywords weigh more
         if score > best_score:
             best_score = score
             best_match = intent
@@ -200,7 +209,7 @@ def handle_slow_pc():
     cpu = system.get_cpu_info()
     mem = system.get_memory_info()
     procs = system.get_top_processes(top_n=10)
-    startup_items = startup.get_startup_programs()
+    startup_items = [i for i in startup.get_startup_programs() if i.get("enabled", True)]
 
     messages = []
     actions = []
@@ -264,7 +273,7 @@ def handle_large_files():
     actions = []
 
     for d in drives:
-        large = storage.get_large_files(d["mountpoint"], top_n=10, min_size_mb=50)
+        large = storage.get_large_files(d["mountpoint"], top_n=10, min_size_mb=50, time_limit=20)
         if large:
             messages.append(f"\n📦 **Large files on {d['mountpoint']}:**")
             for f in large:
@@ -320,11 +329,14 @@ def handle_temp_files():
 
 def handle_startup():
     """Analyze startup programs."""
-    items = startup.get_startup_programs()
+    all_items = startup.get_startup_programs()
+    items = [i for i in all_items if i.get("enabled", True)]
+    disabled = len(all_items) - len(items)
     messages = []
     actions = []
 
-    messages.append(f"⚡ You have **{len(items)} programs** set to run at startup:\n")
+    messages.append(f"⚡ You have **{len(items)} programs** set to run at startup"
+                    + (f" ({disabled} already disabled)" if disabled else "") + ":\n")
 
     for item in items:
         messages.append(f"   • **{item['name']}** — {item['scope']}")
@@ -383,7 +395,7 @@ def handle_memory():
 def handle_cpu():
     """Detailed CPU analysis."""
     cpu = system.get_cpu_info()
-    procs = system.get_top_processes(top_n=10)
+    procs = system.get_top_processes(top_n=10, sort_by="cpu")
     messages = []
 
     messages.append(f"⚙️ **CPU Usage: {cpu['overall_percent']}%**")
@@ -398,8 +410,8 @@ def handle_cpu():
         messages.append(f"   Core {i}: {level} {bar} {pct}%")
 
     # CPU-heavy processes
-    cpu_hogs = sorted(procs, key=lambda p: p["cpu_percent"], reverse=True)[:5]
-    if cpu_hogs[0]["cpu_percent"] > 10:
+    cpu_hogs = procs[:5]
+    if cpu_hogs and cpu_hogs[0]["cpu_percent"] > 10:
         messages.append("\n🔥 **Top CPU consumers:**")
         for p in cpu_hogs:
             if p["cpu_percent"] > 0:
@@ -448,7 +460,7 @@ def handle_full_diagnosis():
     mem = system.get_memory_info()
     drives = storage.get_drive_usage()
     temp = storage.get_temp_files()
-    startup_items = startup.get_startup_programs()
+    startup_items = [i for i in startup.get_startup_programs() if i.get("enabled", True)]
     battery = system.get_battery_info()
 
     messages = []
@@ -589,11 +601,11 @@ def handle_battery_health():
         if bh.get("design_capacity_mwh") and bh.get("full_charge_capacity_mwh"):
             messages.append(f"   • Original capacity: {bh['design_capacity_mwh']} mWh")
             messages.append(f"   • Current max capacity: {bh['full_charge_capacity_mwh']} mWh")
-            if bh.get("health_percent"):
+            if bh.get("health_percent") is not None:
                 messages.append(f"   • Health: **{bh['health_percent']}%**")
-            if bh.get("degradation_percent"):
+            if bh.get("degradation_percent") is not None:
                 messages.append(f"   • Degradation: **{bh['degradation_percent']}%**")
-        if bh.get("cycle_count"):
+        if bh.get("cycle_count") is not None:
             messages.append(f"   • Cycle count: {bh['cycle_count']}")
         messages.append(f"   • Current charge: {bh.get('current_percent', '?')}%")
         messages.append(f"   • Plugged in: {'Yes' if bh.get('power_plugged') else 'No'}")
@@ -603,7 +615,6 @@ def handle_battery_health():
 
 def handle_speed_test():
     """Run internet speed test."""
-    messages = ["🌐 **Internet Speed Test**\n", "Testing download speed..."]
     result = tools.speed_test()
 
     messages = ["🌐 **Internet Speed Test Results**\n"]
@@ -623,33 +634,43 @@ def handle_speed_test():
 
 
 def handle_duplicates():
-    """Find duplicate files."""
-    drives = storage.get_drive_usage()
+    """Find duplicate files in the user's profile (and any other fixed drive)."""
     messages = ["🔍 **Duplicate File Scan**\n"]
     actions = []
 
-    # Scan the largest non-system drive
-    target = "C:\\"
-    for d in drives:
-        if d["mountpoint"] != "C:\\":
-            target = d["mountpoint"]
-            break
+    # Duplicates live in Downloads/Documents/Pictures/Videos, not in C:\\Windows or Program Files.
+    targets = [os.path.expanduser("~")]
+    system_drive = os.path.splitdrive(targets[0])[0].lower()
+    for d in storage.get_drive_usage():
+        if os.path.splitdrive(d["mountpoint"])[0].lower() != system_drive:
+            targets.append(d["mountpoint"])
+    targets = targets[:3]
 
-    result = tools.find_duplicates(target, min_size_mb=10)
-    messages.append(f"Scanned **{result['scanned_files']}** files on {target}")
-    messages.append(f"{result['message']}\n")
+    total_files = 0
+    shown = 0
+    for target in targets:
+        result = tools.find_duplicates(target, min_size_mb=10, time_limit=25)
+        total_files += result["scanned_files"]
+        messages.append(f"Scanned **{result['scanned_files']}** large files in `{target}` — {result['message']}")
 
-    for dup in result.get("duplicates", [])[:10]:
-        messages.append(f"📄 **{dup['count']} copies** — {dup['size_display']} each (wasting {dup['wasted_display']})")
-        for f in dup["files"]:
-            messages.append(f"   • `{f['path']}`")
-            actions.append({
-                "type": "delete_file",
-                "path": f["path"],
-                "name": f["name"],
-                "size": dup["size_display"],
-                "label": f"Delete {f['name']} ({dup['size_display']})",
-            })
+        for dup in result.get("duplicates", [])[:10]:
+            if shown >= 10:
+                break
+            shown += 1
+            messages.append(f"\n📄 **{dup['count']} copies** — {dup['size_display']} each (wasting {dup['wasted_display']})")
+            for f in dup["files"]:
+                messages.append(f"   • `{f['path']}`" + ("  ← oldest, kept" if f.get("keep") else ""))
+                if not f.get("keep"):  # always leave one copy untouched
+                    actions.append({
+                        "type": "delete_file",
+                        "path": f["path"],
+                        "name": f["name"],
+                        "size": dup["size_display"],
+                        "label": f"Delete {f['name']} ({dup['size_display']})",
+                    })
+
+    if not shown:
+        messages.append("\n✅ No duplicate files found.")
 
     return {"title": "Duplicate Files", "messages": messages, "actions": actions}
 
@@ -662,6 +683,8 @@ def handle_system_boost():
     messages.append(f"\nActions performed:")
     for action in result["actions"]:
         messages.append(f"   ✅ {action}")
+    for note in result.get("skipped", []):
+        messages.append(f"   ➖ {note}")
 
     return {"title": "System Boost", "messages": messages, "actions": []}
 

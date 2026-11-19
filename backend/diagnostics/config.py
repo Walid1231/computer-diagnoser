@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
 PRESETS = {
     "gemini": {
         "label": "Google Gemini",
-        "endpoint_url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        "endpoint_url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         "model_name": "gemini-2.0-flash",
         "api_format": "gemini",
         "needs_key": True,
@@ -97,22 +97,32 @@ def load_config() -> dict:
     """Load config from disk, or return defaults."""
     try:
         if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r") as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                config = {**DEFAULT_CONFIG, **saved}
-                return config
+            if isinstance(saved, dict):
+                return {**DEFAULT_CONFIG, **saved}
     except (json.JSONDecodeError, OSError):
         pass
     return dict(DEFAULT_CONFIG)
 
 
 def save_config(config: dict) -> bool:
-    """Save config to disk."""
+    """Save config to disk atomically (a crash mid-write can no longer corrupt it)."""
+    tmp_path = CONFIG_PATH + ".tmp"
     try:
-        with open(CONFIG_PATH, "w") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
+        try:
+            os.chmod(tmp_path, 0o600)  # the file holds an API key; owner-only where supported
+        except OSError:
+            pass
+        os.replace(tmp_path, CONFIG_PATH)
         return True
     except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
         return False
 
 
